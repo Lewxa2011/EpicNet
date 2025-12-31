@@ -1,4 +1,4 @@
-using Epic.OnlineServices;
+﻿using Epic.OnlineServices;
 using Epic.OnlineServices.Connect;
 using Epic.OnlineServices.Lobby;
 using Epic.OnlineServices.P2P;
@@ -33,6 +33,8 @@ namespace EpicNet
         private static P2PInterface _p2pInterface;
         private static ConnectInterface _connectInterface;
         private static ProductUserId _localUserId;
+
+        private static readonly System.Random _rng = new System.Random();
 
         public static event Action OnConnectedToMaster;
         public static event Action OnJoinedRoom;
@@ -183,6 +185,19 @@ namespace EpicNet
             OnConnectedToMaster?.Invoke();
         }
 
+        private static string CreateRoomName()
+        {
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            char[] result = new char[4];
+
+            for (int i = 0; i < result.Length; i++)
+            {
+                result[i] = chars[_rng.Next(chars.Length)];
+            }
+
+            return new string(result);
+        }
+
         /// <summary>
         /// Create a new room
         /// </summary>
@@ -210,7 +225,7 @@ namespace EpicNet
         /// <summary>
         /// Join a random room
         /// </summary>
-        public static void JoinRandomRoom(Dictionary<string, object> expectedRoomProperties = null)
+        public static void JoinRandomRoom(bool createIfNoneAvailable = true, Dictionary<string, object> expectedRoomProperties = null)
         {
             if (!_isConnected)
             {
@@ -260,6 +275,12 @@ namespace EpicNet
                 else
                 {
                     Debug.Log("EpicNet: No rooms available");
+
+                    if (createIfNoneAvailable)
+                    {
+                        Debug.Log("EpicNet: Creating a new room since none are available");
+                        CreateRoom(CreateRoomName());
+                    }
                 }
             });
         }
@@ -274,27 +295,27 @@ namespace EpicNet
                 Debug.LogError("EpicNet: Not connected to EOS!");
                 return;
             }
-        
+
             if (string.IsNullOrEmpty(roomName))
             {
                 Debug.LogError("EpicNet: Room name is null or empty!");
                 return;
             }
-        
+
             var searchOptions = new CreateLobbySearchOptions
             {
                 MaxResults = 10
             };
-        
+
             LobbySearch lobbySearch = default;
             _lobbyInterface.CreateLobbySearch(ref searchOptions, out lobbySearch);
-        
+
             if (lobbySearch == null)
             {
                 Debug.LogError("EpicNet: Failed to create lobby search!");
                 return;
             }
-        
+
             var attributeData = new AttributeData
             {
                 Key = "RoomName",
@@ -303,25 +324,25 @@ namespace EpicNet
                     AsUtf8 = roomName
                 }
             };
-        
+
             var setParamOptions = new LobbySearchSetParameterOptions
             {
                 Parameter = attributeData,
                 ComparisonOp = ComparisonOp.Equal
             };
-        
+
             var setResult = lobbySearch.SetParameter(ref setParamOptions);
             if (setResult != Result.Success)
             {
                 Debug.LogError($"EpicNet: Failed to set lobby search parameter: {setResult}");
                 return;
             }
-        
+
             var findOptions = new LobbySearchFindOptions
             {
                 LocalUserId = _localUserId
             };
-        
+
             lobbySearch.Find(ref findOptions, null, (ref LobbySearchFindCallbackInfo data) =>
             {
                 if (data.ResultCode != Result.Success)
@@ -329,29 +350,29 @@ namespace EpicNet
                     Debug.LogError($"EpicNet: Lobby search failed: {data.ResultCode}");
                     return;
                 }
-        
+
                 var countOptions = new LobbySearchGetSearchResultCountOptions();
                 uint resultCount = lobbySearch.GetSearchResultCount(ref countOptions);
-        
+
                 if (resultCount == 0)
                 {
                     Debug.Log($"EpicNet: No room found with name '{roomName}'");
                     return;
                 }
-        
+
                 // Join first matching lobby
                 var copyOptions = new LobbySearchCopySearchResultByIndexOptions
                 {
                     LobbyIndex = 0
                 };
-        
+
                 var copyResult = lobbySearch.CopySearchResultByIndex(ref copyOptions, out LobbyDetails lobbyDetails);
                 if (copyResult != Result.Success)
                 {
                     Debug.LogError($"EpicNet: Failed to copy lobby result: {copyResult}");
                     return;
                 }
-        
+
                 Debug.Log($"EpicNet: Joining room '{roomName}'");
                 JoinLobby(lobbyDetails);
             });
@@ -534,5 +555,4 @@ namespace EpicNet
 
         #endregion
     }
-
 }
