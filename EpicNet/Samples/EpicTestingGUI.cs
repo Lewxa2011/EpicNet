@@ -1,5 +1,6 @@
 using EpicNet;
 using UnityEngine;
+using System.Collections.Generic;
 
 public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 {
@@ -11,37 +12,55 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
     private int _maxPlayers = 10;
     private string _displayName = "";
     private bool _isLoggingIn = false;
+    private List<EpicRoomInfo> _roomList = new List<EpicRoomInfo>();
+    private bool _showRoomList = false;
+    private string _chatMessage = "";
+    private bool _showNetworkStats = true;
 
     private void Start()
     {
         _playerName = "Player_" + Random.Range(1000, 9999);
         _displayName = _playerName;
         AddLog("EpicNet Testing GUI initialized");
+
+        // Subscribe to room list updates
+        EpicNetwork.OnRoomListUpdate += OnRoomListUpdate;
+    }
+
+    private void OnDestroy()
+    {
+        EpicNetwork.OnRoomListUpdate -= OnRoomListUpdate;
+    }
+
+    private void OnRoomListUpdate(List<EpicRoomInfo> rooms)
+    {
+        _roomList = rooms;
+        AddLog($"<color=cyan>[ROOM LIST]</color> Found {rooms.Count} rooms");
     }
 
     private void OnGUI()
     {
-        GUILayout.BeginArea(new Rect(10, 10, 520, Screen.height - 20));
+        GUILayout.BeginArea(new Rect(10, 10, 540, Screen.height - 20));
 
         _scrollPosition = GUILayout.BeginScrollView(
             _scrollPosition,
             false,
             true,
-            GUILayout.Width(520),
+            GUILayout.Width(540),
             GUILayout.Height(Screen.height - 20)
         );
 
         GUILayout.BeginVertical("box");
 
         // Title
-        GUILayout.Label("<size=20><b>EpicNet Testing GUI</b></size>");
+        GUILayout.Label("<size=20><b>EpicNet Testing GUI (Complete)</b></size>");
         GUILayout.Space(10);
 
         // EOS Status
         DrawEOSStatus();
         GUILayout.Space(10);
 
-        // Login Section (if not logged in)
+        // Login Section
         if (!EpicNetwork.IsLoggedIn)
         {
             DrawLoginSection();
@@ -69,6 +88,13 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
             GUILayout.Space(10);
         }
 
+        // Room List
+        if (EpicNetwork.IsConnected && !EpicNetwork.InRoom)
+        {
+            DrawRoomList();
+            GUILayout.Space(10);
+        }
+
         // Room Controls
         if (EpicNetwork.IsConnected)
         {
@@ -80,6 +106,13 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         if (EpicNetwork.InRoom)
         {
             DrawRoomInfo();
+            GUILayout.Space(10);
+        }
+
+        // Network Stats
+        if (EpicNetwork.InRoom)
+        {
+            DrawNetworkStats();
             GUILayout.Space(10);
         }
 
@@ -120,7 +153,6 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         GUILayout.Label("<i>Quick login using device ID (no account required)</i>");
         GUILayout.Space(5);
 
-        // Display Name Input
         GUILayout.BeginHorizontal();
         GUILayout.Label("Display Name:", GUILayout.Width(100));
         _displayName = GUILayout.TextField(_displayName, GUILayout.Width(300));
@@ -128,7 +160,6 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 
         GUILayout.Space(5);
 
-        // Login Button
         if (GUILayout.Button("Login with Device ID", GUILayout.Height(40)))
         {
             LoginWithDeviceId();
@@ -213,6 +244,52 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         GUILayout.EndVertical();
     }
 
+    private void DrawRoomList()
+    {
+        GUILayout.BeginVertical("box");
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("<b>Available Rooms</b>");
+        GUILayout.FlexibleSpace();
+
+        if (GUILayout.Button("Refresh", GUILayout.Width(80)))
+        {
+            EpicNetwork.GetRoomList();
+            AddLog("Refreshing room list...");
+        }
+
+        _showRoomList = GUILayout.Toggle(_showRoomList, "Show", GUILayout.Width(60));
+        GUILayout.EndHorizontal();
+
+        if (_showRoomList)
+        {
+            if (_roomList.Count == 0)
+            {
+                GUILayout.Label("<i>No rooms available. Click Refresh to search.</i>");
+            }
+            else
+            {
+                foreach (var room in _roomList)
+                {
+                    GUILayout.BeginHorizontal("box");
+                    GUILayout.Label($"{room.Name}");
+                    GUILayout.FlexibleSpace();
+                    GUILayout.Label($"{room.PlayerCount}/{room.MaxPlayers}");
+
+                    if (GUILayout.Button("Join", GUILayout.Width(60)))
+                    {
+                        EpicNetwork.JoinRoom(room.Name);
+                        AddLog($"Joining room {room.Name}...");
+                    }
+
+                    GUILayout.EndHorizontal();
+                }
+            }
+        }
+
+        GUILayout.EndVertical();
+    }
+
     private void DrawRoomControls()
     {
         GUILayout.BeginVertical("box");
@@ -220,13 +297,11 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 
         if (!EpicNetwork.InRoom)
         {
-            // Room Name Input
             GUILayout.BeginHorizontal();
             GUILayout.Label("Room:", GUILayout.Width(80));
             _roomName = GUILayout.TextField(_roomName, GUILayout.Width(200));
             GUILayout.EndHorizontal();
 
-            // Max Players Slider
             GUILayout.BeginHorizontal();
             GUILayout.Label("Max Players:", GUILayout.Width(80));
             _maxPlayers = (int)GUILayout.HorizontalSlider(_maxPlayers, 2, 20, GUILayout.Width(150));
@@ -235,7 +310,6 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 
             GUILayout.Space(5);
 
-            // Room Actions
             GUILayout.BeginHorizontal();
 
             if (GUILayout.Button("Create Room", GUILayout.Height(35)))
@@ -258,25 +332,14 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 
             GUILayout.EndHorizontal();
 
-            GUILayout.BeginHorizontal();
-
-            if (GUILayout.Button("Join Random", GUILayout.Height(35)))
+            if (GUILayout.Button("Join Random Room", GUILayout.Height(35)))
             {
                 EpicNetwork.JoinRandomRoom();
                 AddLog("Searching for random room...");
             }
-
-            if (GUILayout.Button("Refresh Rooms", GUILayout.Height(35)))
-            {
-                AddLog("Refreshing room list...");
-                // TODO: Implement room list refresh
-            }
-
-            GUILayout.EndHorizontal();
         }
         else
         {
-            // In Room Actions
             GUILayout.BeginHorizontal();
 
             if (GUILayout.Button("Leave Room", GUILayout.Height(40), GUILayout.Width(150)))
@@ -285,21 +348,17 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
                 AddLog("Leaving room...");
             }
 
-            if (EpicNetwork.IsMasterClient)
+            if (EpicNetwork.IsMasterClient && GUILayout.Button("Close Room", GUILayout.Height(40)))
             {
-                if (GUILayout.Button("Close Room", GUILayout.Height(40)))
+                if (EpicNetwork.CurrentRoom != null)
                 {
-                    if (EpicNetwork.CurrentRoom != null)
-                    {
-                        EpicNetwork.CurrentRoom.IsOpen = false;
-                        AddLog("Room closed to new players");
-                    }
+                    EpicNetwork.CurrentRoom.IsOpen = false;
+                    AddLog("Room closed to new players");
                 }
             }
 
             GUILayout.EndHorizontal();
 
-            // Test Actions
             GUILayout.Space(5);
             GUILayout.Label("<b>Test Actions</b>");
 
@@ -314,13 +373,13 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
                 );
 
                 EpicNetwork.Instantiate("TestObjectPrefab", randomPos, Quaternion.identity);
-
                 AddLog($"Spawned object at {randomPos}");
             }
 
-            if (GUILayout.Button("Test RPC", GUILayout.Height(30)))
+            if (GUILayout.Button("Send Test RPC", GUILayout.Height(30)))
             {
-                AddLog("Sending test RPC to all players");
+                // This would need a reference to an EpicView
+                AddLog("Test RPC feature - requires EpicView reference");
             }
 
             GUILayout.EndHorizontal();
@@ -364,6 +423,36 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         GUILayout.EndVertical();
     }
 
+    private void DrawNetworkStats()
+    {
+        GUILayout.BeginVertical("box");
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("<b>Network Statistics</b>");
+        GUILayout.FlexibleSpace();
+        _showNetworkStats = GUILayout.Toggle(_showNetworkStats, "Show", GUILayout.Width(60));
+        GUILayout.EndHorizontal();
+
+        if (_showNetworkStats)
+        {
+            GUILayout.Label($"Send Rate: {EpicNetwork.SendRate} Hz");
+            GUILayout.Label($"Ping: {EpicNetwork.Ping} ms");
+            GUILayout.Label($"Network Objects: {FindObjectsByType<EpicView>(FindObjectsSortMode.None).Length}");
+
+            // Test ping button
+            if (EpicNetwork.MasterClient != null && !EpicNetwork.IsMasterClient)
+            {
+                if (GUILayout.Button("Ping Master Client", GUILayout.Height(25)))
+                {
+                    EpicNetwork.SendPing(EpicNetwork.MasterClient);
+                    AddLog("Pinging master client...");
+                }
+            }
+        }
+
+        GUILayout.EndVertical();
+    }
+
     private void DrawDebugLog()
     {
         GUILayout.BeginVertical("box");
@@ -382,9 +471,7 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
 
         if (_showDebugLog)
         {
-            _scrollPosition = GUILayout.BeginScrollView(_scrollPosition);
             GUILayout.Label(_logMessages);
-            GUILayout.EndScrollView();
         }
 
         GUILayout.EndVertical();
@@ -462,9 +549,7 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
             _logMessages = string.Join("\n", lines, lines.Length - 100, 100);
         }
 
-        // Auto-scroll to bottom
         _scrollPosition.y = float.MaxValue;
-
         Debug.Log($"EpicNet: {message}");
     }
 }

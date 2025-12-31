@@ -11,10 +11,20 @@ namespace EpicNet
         public int ViewID { get; set; }
         public EpicPlayer Owner { get; set; }
         public bool IsMine => Owner?.IsLocal ?? false;
+        public string PrefabName { get; set; }
 
         [SerializeField] private OwnershipOption ownershipTransfer = OwnershipOption.Takeover;
+        [SerializeField] private ViewSynchronization synchronization = ViewSynchronization.ReliableDeltaCompressed;
 
         private Action<int, EpicPlayer> _pendingOwnershipRequest;
+
+        /// <summary>
+        /// Call an RPC on this view
+        /// </summary>
+        public void RPC(string methodName, RpcTarget target, params object[] parameters)
+        {
+            EpicNetwork.RPC(this, methodName, target, parameters);
+        }
 
         /// <summary>
         /// Transfer ownership of this view to another player

@@ -46,11 +46,7 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
 
     private void Update()
     {
-        // Process incoming P2P messages for ownership transfers
-        if (EpicNetwork.InRoom)
-        {
-            EpicNetwork.ProcessP2PMessages();
-        }
+        EpicNetwork.Update();
     }
 
     private void OnLogin()
@@ -71,7 +67,6 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
         base.OnJoinedRoom();
         Debug.Log($"Joined room. IsMasterClient: {EpicNetwork.IsMasterClient}");
 
-        // Spawn local player
         SpawnLocalPlayer();
     }
 
@@ -93,11 +88,10 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
         Debug.Log($"Master client switched! New master: {EpicNetwork.MasterClient?.NickName}");
         Debug.Log($"Am I the master? {EpicNetwork.IsMasterClient}");
 
-        // Handle any master-specific logic here
         if (EpicNetwork.IsMasterClient)
         {
             Debug.Log("I am now the master client!");
-            // Take over any master-only responsibilities
+
             OnBecameMasterClient();
         }
     }
@@ -113,7 +107,6 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
 
     private void OnBecameMasterClient()
     {
-        // Example: Master client could manage game state, spawn enemies, etc.
         Debug.Log("Taking over master client responsibilities...");
     }
 
@@ -122,7 +115,6 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
         base.OnLeftRoom();
         Debug.Log("Left room");
 
-        // Clean up local player
         if (localPlayerInstance != null)
         {
             Destroy(localPlayerInstance);
