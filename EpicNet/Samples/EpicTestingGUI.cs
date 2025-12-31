@@ -102,6 +102,13 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
             GUILayout.Space(10);
         }
 
+        // Room Controls
+        if (EpicNetwork.IsConnected)
+        {
+            DrawNameChanger();
+            GUILayout.Space(10);
+        }
+
         // Room Info
         if (EpicNetwork.InRoom)
         {
@@ -122,6 +129,28 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         GUILayout.EndVertical();
         GUILayout.EndScrollView();
         GUILayout.EndArea();
+    }
+
+    private void DrawNameChanger()
+    {
+        GUILayout.BeginVertical("box");
+        GUILayout.Label("<b>Name Changer</b>");
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Display Name:", GUILayout.Width(100));
+        _displayName = GUILayout.TextField(_displayName, GUILayout.Width(300));
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(5);
+
+        if (GUILayout.Button($"Set Name to {_displayName}", GUILayout.Height(40)))
+        {
+            // this literally just sets the epic network internal display name and the local player's nickname
+            // it does NOT notify other players of the change!!!!!
+            EpicNetwork.SetNickName(_displayName);
+        }
+
+        GUILayout.EndVertical();
     }
 
     private void DrawEOSStatus()

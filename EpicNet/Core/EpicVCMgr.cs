@@ -1,3 +1,4 @@
+
 using UnityEngine;
 using System.Collections.Generic;
 
@@ -15,9 +16,10 @@ namespace EpicNet
         }
 
         public static string CurrentDevice { get; private set; }
-        public static bool IsPushToTalk { get; set; } = false;
 
         public const SampleRate sr = SampleRate.TwentyFourKHz;
+
+        public const float VoiceActivationLevel = 0.07f;
 
         public static void Initialize()
         {
@@ -30,11 +32,6 @@ namespace EpicNet
             {
                 Debug.LogError("EpicNet VC: No microphone detected!");
             }
-        }
-
-        public static bool IsTransmitting()
-        {
-            return true;
         }
     }
 }

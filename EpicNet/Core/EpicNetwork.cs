@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using UnityEngine;
+using Attribute = Epic.OnlineServices.Lobby.Attribute;
 
 namespace EpicNet
 {
@@ -62,6 +63,10 @@ namespace EpicNet
 
         // Room listing
         private static List<EpicRoomInfo> _cachedRoomList = new List<EpicRoomInfo>();
+
+        // Late joiner management
+        private static Dictionary<ProductUserId, bool> _pendingInitialState = new Dictionary<ProductUserId, bool>();
+        private static float _lastInitialStateSendTime = 0f;
 
         // Events
         public static event Action OnConnectedToMaster;
@@ -200,10 +205,22 @@ namespace EpicNet
                 LeaveRoom();
             }
 
+            // Unsubscribe from P2P
+            if (_p2pInterface != null && _p2pNotificationId != 0)
+            {
+                _p2pInterface.RemoveNotifyPeerConnectionRequest(_p2pNotificationId);
+                _p2pNotificationId = 0;
+            }
+
             _localUserId = null;
             _isConnected = false;
             _localPlayer = null;
             _masterClient = null;
+            _networkObjects.Clear();
+            _bufferedRPCs.Clear();
+            _ownershipRequestCallbacks.Clear();
+            _pendingInitialState.Clear();
+
             Debug.Log("EpicNet: Logged out");
         }
 
@@ -305,9 +322,40 @@ namespace EpicNet
             }
         }
 
+        private static void TrySendPendingInitialStates()
+        {
+            if (!IsMasterClient || _pendingInitialState.Count == 0) return;
+
+            // Throttle sends to once per second
+            if (Time.time - _lastInitialStateSendTime < 1f) return;
+
+            _lastInitialStateSendTime = Time.time;
+
+            // Try to send to all pending players
+            var playersToRemove = new List<ProductUserId>();
+
+            foreach (var kvp in _pendingInitialState)
+            {
+                var userId = kvp.Key;
+                var player = _playerList.Find(p => p.UserId == userId);
+
+                if (player != null)
+                {
+                    Debug.Log($"EpicNet: Sending initial state to {player.NickName}");
+                    SendInitialStateToPlayer(player);
+                    playersToRemove.Add(userId);
+                }
+            }
+
+            // Remove players we've sent to
+            foreach (var userId in playersToRemove)
+            {
+                _pendingInitialState.Remove(userId);
+            }
+        }
+
         private static void HandlePlayerJoined(ProductUserId userId)
         {
-            // Don't add ourselves again
             if (userId == _localUserId) return;
 
             var player = new EpicPlayer(userId, $"Player_{userId}");
@@ -316,9 +364,10 @@ namespace EpicNet
             Debug.Log($"EpicNet: Player joined: {player.NickName}");
             OnPlayerEnteredRoom?.Invoke(player);
 
-            // Send initial state to the new player if we're master
             if (IsMasterClient)
             {
+                _pendingInitialState[userId] = true;
+                // Immediately try to send (or add a small delay)
                 SendInitialStateToPlayer(player);
             }
         }
@@ -429,6 +478,15 @@ namespace EpicNet
                     Debug.LogWarning($"EpicNet: Failed to promote to lobby owner: {data.ResultCode}");
                 }
             });
+        }
+
+        public static void SetNickName(string nickName)
+        {
+            NickName = nickName;
+            if (_localPlayer != null)
+            {
+                _localPlayer.NickName = nickName;
+            }
         }
 
         private static string CreateRoomName()
@@ -659,6 +717,13 @@ namespace EpicNet
                 MaxPlayers = (int)lobbyInfo.Value.MaxMembers,
                 IsOpen = true
             };
+
+            // Retrieve custom RoomName attribute
+            var attributeOptions = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = "RoomName" };
+            if (lobbyDetails.CopyAttributeByKey(ref attributeOptions, out Attribute? attr) == Result.Success && attr.HasValue)
+            {
+                roomInfo.Name = attr.Value.Data.Value.Value.ToString();
+            }
 
             return roomInfo;
         }
@@ -1054,6 +1119,9 @@ namespace EpicNet
 
             // Process P2P messages
             ProcessP2PMessages();
+
+            // Try to send pending initial states (for late joiners)
+            TrySendPendingInitialStates();
 
             // Sync observables at the configured rate
             if (Time.time - _lastSyncTime >= _syncInterval)
@@ -1475,8 +1543,23 @@ namespace EpicNet
 
         private static void SendInitialStateToPlayer(EpicPlayer player)
         {
+            if (player == null || player.UserId == null)
+            {
+                Debug.LogWarning("EpicNet: Cannot send initial state - invalid player");
+                return;
+            }
+
             byte[] stateData = SerializeInitialState();
-            SendP2PPacket(player.UserId, stateData);
+
+            if (stateData.Length > 1) // More than just the packet type byte
+            {
+                SendP2PPacket(player.UserId, stateData);
+                Debug.Log($"EpicNet: Sent initial state to {player.NickName} ({stateData.Length} bytes, {_networkObjects.Count} objects, {_bufferedRPCs.Count} RPCs)");
+            }
+            else
+            {
+                Debug.Log($"EpicNet: No initial state to send (empty room)");
+            }
         }
 
         /// <summary>
@@ -2013,6 +2096,7 @@ namespace EpicNet
                 _playerList.Clear();
                 _networkObjects.Clear();
                 _bufferedRPCs.Clear();
+                _pendingInitialState.Clear(); // ADD THIS LINE
 
                 Debug.Log("EpicNet: Left room");
                 OnLeftRoom?.Invoke();

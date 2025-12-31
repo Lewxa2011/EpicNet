@@ -1,4 +1,4 @@
-using Concentus.Enums;
+﻿using Concentus.Enums;
 using Concentus.Structs;
 using System;
 using UnityEngine;
@@ -35,6 +35,11 @@ namespace EpicNet
         private short[] _pcmOut = new short[FRAME_SIZE];
         private float[] _floatOut = new float[FRAME_SIZE];
         private byte[] _opusPacket = new byte[MAX_OPUS_PACKET_SIZE];
+
+        const float VAD_THRESHOLD = 0.015f;   // adjust if needed
+        const int VAD_SAMPLES = 256;
+
+        private float[] _vadBuffer = new float[VAD_SAMPLES];
 
         private void Awake()
         {
@@ -125,13 +130,31 @@ namespace EpicNet
             _opusPacket = null;
         }
 
+        private bool IsMicActive()
+        {
+            if (_micClip == null) return false;
+
+            int micPos = Microphone.GetPosition(EpicVCMgr.CurrentDevice);
+            if (micPos < VAD_SAMPLES) return false;
+
+            _micClip.GetData(_vadBuffer, micPos - VAD_SAMPLES);
+
+            float sum = 0f;
+            for (int i = 0; i < VAD_SAMPLES; i++)
+                sum += _vadBuffer[i] * _vadBuffer[i];
+
+            float rms = Mathf.Sqrt(sum / VAD_SAMPLES);
+            return rms > VAD_THRESHOLD;
+        }
+
         public void OnEpicSerializeView(EpicStream stream, EpicMessageInfo info)
         {
             if (stream.IsWriting)
             {
-                if (!EpicVCMgr.IsTransmitting()) return;
+                if (!IsMicActive()) return;
 
-                int micPos = Microphone.GetPosition(null);
+                int micPos = Microphone.GetPosition(EpicVCMgr.CurrentDevice);
+
                 int diff = (micPos - _lastSamplePos + _micClip.samples) % _micClip.samples;
 
                 while (diff >= FRAME_SIZE)
@@ -170,11 +193,32 @@ namespace EpicNet
                         false
                     );
 
+                    if (decodedSamples <= 0)
+                        return;
+
+                    // PCM16 → float
                     for (int i = 0; i < decodedSamples; i++)
                         _floatOut[i] = _pcmOut[i] / 32768f;
 
-                    audioSource.clip.SetData(_floatOut, _playbackWritePos);
-                    _playbackWritePos = (_playbackWritePos + decodedSamples) % audioSource.clip.samples;
+                    int clipSamples = audioSource.clip.samples;
+                    int samplesLeft = clipSamples - _playbackWritePos;
+
+                    if (decodedSamples <= samplesLeft)
+                    {
+                        // Single contiguous write
+                        audioSource.clip.SetData(_floatOut, _playbackWritePos);
+                        _playbackWritePos += decodedSamples;
+                    }
+                    else
+                    {
+                        // Wrap write
+                        audioSource.clip.SetData(_floatOut, _playbackWritePos);
+
+                        int remaining = decodedSamples - samplesLeft;
+                        audioSource.clip.SetData(_floatOut, 0);
+
+                        _playbackWritePos = remaining;
+                    }
                 }
             }
         }
