@@ -269,8 +269,92 @@ namespace EpicNet
         /// </summary>
         public static void JoinRoom(string roomName)
         {
-            // Implementation similar to JoinRandomRoom but filtered by name
-            Debug.Log($"EpicNet: Joining room {roomName}");
+            if (!_isConnected)
+            {
+                Debug.LogError("EpicNet: Not connected to EOS!");
+                return;
+            }
+        
+            if (string.IsNullOrEmpty(roomName))
+            {
+                Debug.LogError("EpicNet: Room name is null or empty!");
+                return;
+            }
+        
+            var searchOptions = new CreateLobbySearchOptions
+            {
+                MaxResults = 10
+            };
+        
+            LobbySearch lobbySearch = default;
+            _lobbyInterface.CreateLobbySearch(ref searchOptions, out lobbySearch);
+        
+            if (lobbySearch == null)
+            {
+                Debug.LogError("EpicNet: Failed to create lobby search!");
+                return;
+            }
+        
+            var attributeData = new AttributeData
+            {
+                Key = "RoomName",
+                Value = new AttributeDataValue
+                {
+                    AsUtf8 = roomName
+                }
+            };
+        
+            var setParamOptions = new LobbySearchSetParameterOptions
+            {
+                Parameter = attributeData,
+                ComparisonOp = ComparisonOp.Equal
+            };
+        
+            var setResult = lobbySearch.SetParameter(ref setParamOptions);
+            if (setResult != Result.Success)
+            {
+                Debug.LogError($"EpicNet: Failed to set lobby search parameter: {setResult}");
+                return;
+            }
+        
+            var findOptions = new LobbySearchFindOptions
+            {
+                LocalUserId = _localUserId
+            };
+        
+            lobbySearch.Find(ref findOptions, null, (ref LobbySearchFindCallbackInfo data) =>
+            {
+                if (data.ResultCode != Result.Success)
+                {
+                    Debug.LogError($"EpicNet: Lobby search failed: {data.ResultCode}");
+                    return;
+                }
+        
+                var countOptions = new LobbySearchGetSearchResultCountOptions();
+                uint resultCount = lobbySearch.GetSearchResultCount(ref countOptions);
+        
+                if (resultCount == 0)
+                {
+                    Debug.Log($"EpicNet: No room found with name '{roomName}'");
+                    return;
+                }
+        
+                // Join first matching lobby
+                var copyOptions = new LobbySearchCopySearchResultByIndexOptions
+                {
+                    LobbyIndex = 0
+                };
+        
+                var copyResult = lobbySearch.CopySearchResultByIndex(ref copyOptions, out LobbyDetails lobbyDetails);
+                if (copyResult != Result.Success)
+                {
+                    Debug.LogError($"EpicNet: Failed to copy lobby result: {copyResult}");
+                    return;
+                }
+        
+                Debug.Log($"EpicNet: Joining room '{roomName}'");
+                JoinLobby(lobbyDetails);
+            });
         }
 
         /// <summary>
@@ -450,4 +534,5 @@ namespace EpicNet
 
         #endregion
     }
+
 }
