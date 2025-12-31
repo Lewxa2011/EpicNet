@@ -444,7 +444,7 @@ public class EpicTestingGUI : EpicMonoBehaviourCallbacks
         AddLog($"<color=orange>[PLAYER LEFT]</color> {otherPlayer.NickName} left the room");
     }
 
-    public override void OnMasterClientSwitched()
+    public override void OnMasterClientSwitched(EpicPlayer newMaster)
     {
         string status = EpicNetwork.IsMasterClient ? "You are now" : "Someone else is now";
         AddLog($"<color=blue>[MASTER SWITCH]</color> {status} the master client");

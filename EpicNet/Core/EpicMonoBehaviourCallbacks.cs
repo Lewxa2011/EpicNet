@@ -33,6 +33,6 @@ namespace EpicNet
         public virtual void OnLeftRoom() { }
         public virtual void OnPlayerEnteredRoom(EpicPlayer newPlayer) { }
         public virtual void OnPlayerLeftRoom(EpicPlayer otherPlayer) { }
-        public virtual void OnMasterClientSwitched() { }
+        public virtual void OnMasterClientSwitched(EpicPlayer newMaster) { }
     }
 }

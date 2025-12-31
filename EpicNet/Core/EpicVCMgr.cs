@@ -5,10 +5,19 @@ namespace EpicNet
 {
     public static class EpicVCMgr
     {
+        public enum SampleRate : int
+        {
+            EightKHz = 8000,
+            TwelveKHz = 12000,
+            SixteenKHz = 16000,
+            TwentyFourKHz = 24000,
+            FortyEightKHz = 48000
+        }
+
         public static string CurrentDevice { get; private set; }
         public static bool IsPushToTalk { get; set; } = false;
 
-        public const int SampleRate = 22050;
+        public const SampleRate sr = SampleRate.TwentyFourKHz;
 
         public static void Initialize()
         {
