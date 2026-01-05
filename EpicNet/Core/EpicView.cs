@@ -12,11 +12,35 @@ namespace EpicNet
         public EpicPlayer Owner { get; set; }
         public bool IsMine => Owner?.IsLocal ?? false;
         public string PrefabName { get; set; }
+        public bool IsSceneObject { get; private set; }
 
         [SerializeField] private OwnershipOption ownershipTransfer = OwnershipOption.Takeover;
         [SerializeField] private ViewSynchronization synchronization = ViewSynchronization.ReliableDeltaCompressed;
 
         private Action<int, EpicPlayer> _pendingOwnershipRequest;
+        private bool _registeredForRoomJoin;
+
+        private void Awake()
+        {
+            // If we're not in a room yet, this is a scene object
+            if (!EpicNetwork.InRoom)
+            {
+                IsSceneObject = true;
+                EpicNetwork.OnJoinedRoom += OnRoomJoined;
+                _registeredForRoomJoin = true;
+            }
+        }
+
+        private void OnRoomJoined()
+        {
+            if (!IsSceneObject) return;
+
+            // Assign scene objects to the master client
+            Owner = EpicNetwork.MasterClient;
+            ViewID = EpicNetwork.RegisterSceneObject(this);
+
+            Debug.Log($"EpicNet: Scene object '{gameObject.name}' assigned to master client with ViewID {ViewID}");
+        }
 
         /// <summary>
         /// Call an RPC on this view
@@ -24,6 +48,22 @@ namespace EpicNet
         public void RPC(string methodName, RpcTarget target, params object[] parameters)
         {
             EpicNetwork.RPC(this, methodName, target, parameters);
+        }
+
+        /// <summary>
+        /// Call an RPC on this view targeting a specific player
+        /// </summary>
+        public void RPC(string methodName, EpicPlayer targetPlayer, params object[] parameters)
+        {
+            EpicNetwork.RPC(this, methodName, targetPlayer, parameters);
+        }
+
+        /// <summary>
+        /// Call an RPC on this view targeting a specific player with reliability option
+        /// </summary>
+        public void RPC(string methodName, EpicPlayer targetPlayer, bool reliable, params object[] parameters)
+        {
+            EpicNetwork.RPC(this, methodName, targetPlayer, reliable, parameters);
         }
 
         /// <summary>
@@ -120,6 +160,10 @@ namespace EpicNet
 
         private void OnDestroy()
         {
+            if (_registeredForRoomJoin)
+            {
+                EpicNetwork.OnJoinedRoom -= OnRoomJoined;
+            }
             EpicNetwork.UnregisterNetworkObject(ViewID);
         }
     }

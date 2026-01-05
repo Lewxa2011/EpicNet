@@ -68,6 +68,34 @@ namespace EpicNet
         private static Dictionary<ProductUserId, bool> _pendingInitialState = new Dictionary<ProductUserId, bool>();
         private static float _lastInitialStateSendTime = 0f;
 
+        // Reconnection handling
+        private static string _lastRoomName;
+        private static bool _wasInRoom;
+        private static bool _isReconnecting;
+        private static float _reconnectAttemptTime;
+        private static int _reconnectAttempts;
+        public static bool AutoReconnect { get; set; } = true;
+        public static float ReconnectDelay { get; set; } = 2f;
+        public static int MaxReconnectAttempts { get; set; } = 5;
+        public static bool IsReconnecting => _isReconnecting;
+
+        // Kick/Ban system
+        private static HashSet<string> _bannedPlayerIds = new HashSet<string>();
+
+        // Room password
+        private static string _currentRoomPassword;
+        private static string _pendingJoinPassword;
+
+        // Network stats
+        private static long _bytesSent;
+        private static long _bytesReceived;
+        private static int _packetsSent;
+        private static int _packetsReceived;
+        private static float _statsResetTime;
+        private static Queue<float> _recentPings = new Queue<float>();
+        private static int _packetsLost;
+        private static int _expectedPackets;
+
         // Events
         public static event Action OnConnectedToMaster;
         public static event Action OnJoinedRoom;
@@ -78,6 +106,70 @@ namespace EpicNet
         public static event Action OnLoginSuccess;
         public static event Action<Result> OnLoginFailed;
         public static event Action<List<EpicRoomInfo>> OnRoomListUpdate;
+        public static event Action OnReconnecting;
+        public static event Action OnReconnected;
+        public static event Action OnReconnectFailed;
+        public static event Action<string> OnKicked; // string = reason
+        public static event Action<string> OnJoinRoomFailed; // string = reason
+
+        /// <summary>
+        /// Network statistics
+        /// </summary>
+        public struct NetworkStats
+        {
+            public long BytesSent;
+            public long BytesReceived;
+            public int PacketsSent;
+            public int PacketsReceived;
+            public float BytesPerSecondSent;
+            public float BytesPerSecondReceived;
+            public float PacketLossPercent;
+            public int AveragePing;
+            public float Duration;
+        }
+
+        /// <summary>
+        /// Get current network statistics
+        /// </summary>
+        public static NetworkStats GetNetworkStats()
+        {
+            float duration = Time.time - _statsResetTime;
+            float avgPing = 0;
+            if (_recentPings.Count > 0)
+            {
+                float sum = 0;
+                foreach (var p in _recentPings) sum += p;
+                avgPing = sum / _recentPings.Count;
+            }
+
+            return new NetworkStats
+            {
+                BytesSent = _bytesSent,
+                BytesReceived = _bytesReceived,
+                PacketsSent = _packetsSent,
+                PacketsReceived = _packetsReceived,
+                BytesPerSecondSent = duration > 0 ? _bytesSent / duration : 0,
+                BytesPerSecondReceived = duration > 0 ? _bytesReceived / duration : 0,
+                PacketLossPercent = _expectedPackets > 0 ? (_packetsLost / (float)_expectedPackets) * 100f : 0,
+                AveragePing = (int)avgPing,
+                Duration = duration
+            };
+        }
+
+        /// <summary>
+        /// Reset network statistics
+        /// </summary>
+        public static void ResetNetworkStats()
+        {
+            _bytesSent = 0;
+            _bytesReceived = 0;
+            _packetsSent = 0;
+            _packetsReceived = 0;
+            _packetsLost = 0;
+            _expectedPackets = 0;
+            _recentPings.Clear();
+            _statsResetTime = Time.time;
+        }
 
         private struct BufferedRPC
         {
@@ -99,7 +191,8 @@ namespace EpicNet
             DestroyObject = 7,
             Ping = 8,
             Pong = 9,
-            InitialState = 10
+            InitialState = 10,
+            Kick = 11
         }
 
         /// <summary>
@@ -127,6 +220,45 @@ namespace EpicNet
 
             Debug.Log($"EpicNet: Logging in with Device ID as '{displayName}'...");
 
+#if UNITY_ANDROID || UNITY_IOS
+            // On mobile platforms, we need to create the device ID first
+            CreateDeviceIdThenLogin(displayName, callback);
+#else
+            // On desktop platforms, we can try to login directly
+            PerformDeviceIdLogin(displayName, callback);
+#endif
+        }
+
+        private static void CreateDeviceIdThenLogin(string displayName, Action<bool, string> callback)
+        {
+            var eosManager = EOSManager.Instance;
+            var platform = eosManager.GetEOSPlatformInterface();
+            var connectInterface = platform.GetConnectInterface();
+
+            var createDeviceIdOptions = new Epic.OnlineServices.Connect.CreateDeviceIdOptions
+            {
+                DeviceModel = SystemInfo.deviceModel
+            };
+
+            connectInterface.CreateDeviceId(ref createDeviceIdOptions, null, (ref Epic.OnlineServices.Connect.CreateDeviceIdCallbackInfo data) =>
+            {
+                if (data.ResultCode == Result.Success || data.ResultCode == Result.DuplicateNotAllowed)
+                {
+                    // Device ID created or already exists, proceed with login
+                    Debug.Log($"EpicNet: Device ID ready (Result: {data.ResultCode}), proceeding with login...");
+                    PerformDeviceIdLogin(displayName, callback);
+                }
+                else
+                {
+                    Debug.LogError($"EpicNet: Failed to create device ID: {data.ResultCode}");
+                    OnLoginFailed?.Invoke(data.ResultCode);
+                    callback?.Invoke(false, $"Failed to create device ID: {data.ResultCode}");
+                }
+            });
+        }
+
+        private static void PerformDeviceIdLogin(string displayName, Action<bool, string> callback)
+        {
             var connectLoginOptions = new LoginOptions
             {
                 Credentials = new Credentials
@@ -359,6 +491,17 @@ namespace EpicNet
             if (userId == _localUserId) return;
 
             var player = new EpicPlayer(userId, $"Player_{userId}");
+
+            // Check if player is banned (master client only)
+            if (IsMasterClient && IsPlayerBanned(userId.ToString()))
+            {
+                Debug.Log($"EpicNet: Banned player tried to join, kicking: {userId}");
+                // Need to add them temporarily to kick them
+                _playerList.Add(player);
+                KickPlayer(player, "You are banned from this room");
+                return;
+            }
+
             _playerList.Add(player);
 
             Debug.Log($"EpicNet: Player joined: {player.NickName}");
@@ -528,11 +671,33 @@ namespace EpicNet
                 OnLobbyCreated(ref data, roomName);
 
                 // Set custom room properties after creation
-                if (data.ResultCode == Result.Success && roomOptions.CustomRoomProperties != null)
+                if (data.ResultCode == Result.Success)
                 {
-                    SetRoomProperties(roomOptions.CustomRoomProperties);
+                    // Store password hash if set
+                    if (roomOptions.HasPassword)
+                    {
+                        _currentRoomPassword = roomOptions.Password;
+                        string passwordHash = HashPassword(roomOptions.Password);
+                        SetRoomProperties(new Dictionary<string, object> { { "_password", passwordHash } });
+                    }
+
+                    if (roomOptions.CustomRoomProperties != null)
+                    {
+                        SetRoomProperties(roomOptions.CustomRoomProperties);
+                    }
                 }
             });
+        }
+
+        private static string HashPassword(string password)
+        {
+            // Simple hash for password comparison
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] bytes = System.Text.Encoding.UTF8.GetBytes(password);
+                byte[] hash = sha.ComputeHash(bytes);
+                return Convert.ToBase64String(hash);
+            }
         }
 
         /// <summary>
@@ -799,9 +964,24 @@ namespace EpicNet
         }
 
         /// <summary>
+        /// Join a specific room by name with password
+        /// </summary>
+        public static void JoinRoom(string roomName, string password, bool createFallback = true)
+        {
+            _pendingJoinPassword = password;
+            JoinRoomInternal(roomName, createFallback);
+        }
+
+        /// <summary>
         /// Join a specific room by name
         /// </summary>
-        public static void JoinRoom(string roomName)
+        public static void JoinRoom(string roomName, bool createFallback = true)
+        {
+            _pendingJoinPassword = null;
+            JoinRoomInternal(roomName, createFallback);
+        }
+
+        private static void JoinRoomInternal(string roomName, bool createFallback)
         {
             if (!_isConnected)
             {
@@ -870,6 +1050,7 @@ namespace EpicNet
                 if (resultCount == 0)
                 {
                     Debug.Log($"EpicNet: No room found with name '{roomName}'");
+                    if (createFallback) CreateRoom(roomName);
                     return;
                 }
 
@@ -907,7 +1088,7 @@ namespace EpicNet
         }
 
         /// <summary>
-        /// Instantiate a networked object
+        /// Instantiate a networked object (uses pooling if enabled)
         /// </summary>
         public static GameObject Instantiate(string prefabName, Vector3 position, Quaternion rotation)
         {
@@ -917,15 +1098,26 @@ namespace EpicNet
                 return null;
             }
 
-            GameObject prefab = Resources.Load<GameObject>(prefabName);
-            if (prefab == null)
+            int viewId = GenerateViewID();
+            GameObject obj;
+
+            // Try to get from pool first
+            if (EpicPool.Enabled)
             {
-                Debug.LogError($"EpicNet: Prefab '{prefabName}' not found in Resources!");
-                return null;
+                obj = EpicPool.Get(prefabName, position, rotation);
+            }
+            else
+            {
+                GameObject prefab = Resources.Load<GameObject>(prefabName);
+                if (prefab == null)
+                {
+                    Debug.LogError($"EpicNet: Prefab '{prefabName}' not found in Resources!");
+                    return null;
+                }
+                obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
             }
 
-            int viewId = GenerateViewID();
-            GameObject obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
+            if (obj == null) return null;
 
             var view = obj.GetComponent<EpicView>();
             if (view != null)
@@ -943,7 +1135,7 @@ namespace EpicNet
         }
 
         /// <summary>
-        /// Destroy a networked object
+        /// Destroy a networked object (returns to pool if enabled)
         /// </summary>
         public static void Destroy(GameObject obj)
         {
@@ -960,7 +1152,15 @@ namespace EpicNet
                 UnregisterNetworkObject(view.ViewID);
             }
 
-            UnityEngine.Object.Destroy(obj);
+            // Return to pool if enabled, otherwise destroy
+            if (EpicPool.Enabled && view != null && !string.IsNullOrEmpty(view.PrefabName))
+            {
+                EpicPool.Return(obj);
+            }
+            else
+            {
+                UnityEngine.Object.Destroy(obj);
+            }
         }
 
         private static void SendInstantiateMessage(int viewId, string prefabName, Vector3 position, Quaternion rotation, EpicPlayer owner)
@@ -1018,6 +1218,11 @@ namespace EpicNet
                 });
             }
 
+            // Determine if unreliable
+            bool unreliable = target == RpcTarget.AllUnreliable ||
+                              target == RpcTarget.OthersUnreliable ||
+                              target == RpcTarget.MasterClientUnreliable;
+
             // Send to targets
             switch (target)
             {
@@ -1025,38 +1230,80 @@ namespace EpicNet
                 case RpcTarget.AllBuffered:
                 case RpcTarget.AllViaServer:
                 case RpcTarget.AllBufferedViaServer:
+                case RpcTarget.AllUnreliable:
                     // Execute locally
                     ExecuteRPC(view.ViewID, methodName, parameters, _localPlayer);
                     // Send to others
-                    SendRPCToOthers(rpcData);
+                    SendRPCToOthers(rpcData, !unreliable);
                     break;
 
                 case RpcTarget.Others:
                 case RpcTarget.OthersBuffered:
-                    SendRPCToOthers(rpcData);
+                case RpcTarget.OthersUnreliable:
+                    SendRPCToOthers(rpcData, !unreliable);
                     break;
 
                 case RpcTarget.MasterClient:
+                case RpcTarget.MasterClientUnreliable:
                     if (IsMasterClient)
                     {
                         ExecuteRPC(view.ViewID, methodName, parameters, _localPlayer);
                     }
                     else if (_masterClient != null)
                     {
-                        SendP2PPacket(_masterClient.UserId, rpcData);
+                        SendP2PPacket(_masterClient.UserId, rpcData, !unreliable);
                     }
                     break;
             }
         }
 
-        private static void SendRPCToOthers(byte[] rpcData)
+        private static void SendRPCToOthers(byte[] rpcData, bool reliable = true)
         {
             foreach (var player in _playerList)
             {
                 if (player.UserId != _localUserId)
                 {
-                    SendP2PPacket(player.UserId, rpcData);
+                    SendP2PPacket(player.UserId, rpcData, reliable);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Call an RPC on a networked object targeting a specific player
+        /// </summary>
+        public static void RPC(EpicView view, string methodName, EpicPlayer targetPlayer, params object[] parameters)
+        {
+            RPC(view, methodName, targetPlayer, true, parameters);
+        }
+
+        /// <summary>
+        /// Call an RPC on a networked object targeting a specific player with reliability option
+        /// </summary>
+        public static void RPC(EpicView view, string methodName, EpicPlayer targetPlayer, bool reliable, params object[] parameters)
+        {
+            if (!InRoom)
+            {
+                Debug.LogError("EpicNet: Cannot send RPC while not in a room!");
+                return;
+            }
+
+            if (targetPlayer == null)
+            {
+                Debug.LogError("EpicNet: Target player is null!");
+                return;
+            }
+
+            int rpcId = _rpcIdCounter++;
+            var rpcData = SerializeRPC(view.ViewID, methodName, parameters, rpcId, RpcTarget.Others);
+
+            // If targeting self, execute locally
+            if (targetPlayer.UserId == _localUserId)
+            {
+                ExecuteRPC(view.ViewID, methodName, parameters, _localPlayer);
+            }
+            else
+            {
+                SendP2PPacket(targetPlayer.UserId, rpcData, reliable);
             }
         }
 
@@ -1115,7 +1362,12 @@ namespace EpicNet
         /// </summary>
         public static void Update()
         {
-            if (!InRoom) return;
+            // Handle auto-reconnection when not in room
+            if (!InRoom)
+            {
+                TryAutoReconnect();
+                return;
+            }
 
             // Process P2P messages
             ProcessP2PMessages();
@@ -1205,6 +1457,8 @@ namespace EpicNet
 
                 if (receiveResult == Result.Success)
                 {
+                    _bytesReceived += bytesWritten;
+                    _packetsReceived++;
                     ProcessReceivedPacket(peerId, data);
                 }
 
@@ -1250,6 +1504,9 @@ namespace EpicNet
                     break;
                 case PacketType.InitialState:
                     HandleInitialStateReceived(senderId, data);
+                    break;
+                case PacketType.Kick:
+                    HandleKickReceived(senderId, data);
                     break;
             }
         }
@@ -1400,11 +1657,21 @@ namespace EpicNet
 
             string ownerIdString = System.Text.Encoding.UTF8.GetString(data, offset, ownerIdLength);
 
-            // Instantiate the object
-            GameObject prefab = Resources.Load<GameObject>(prefabName);
-            if (prefab != null)
+            // Instantiate the object (use pool if enabled)
+            GameObject obj;
+            if (EpicPool.Enabled)
             {
-                GameObject obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
+                obj = EpicPool.Get(prefabName, position, rotation);
+            }
+            else
+            {
+                GameObject prefab = Resources.Load<GameObject>(prefabName);
+                if (prefab == null) return;
+                obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
+            }
+
+            if (obj != null)
+            {
                 var view = obj.GetComponent<EpicView>();
 
                 if (view != null)
@@ -1428,7 +1695,15 @@ namespace EpicNet
                 UnregisterNetworkObject(viewId);
                 if (view != null && view.gameObject != null)
                 {
-                    UnityEngine.Object.Destroy(view.gameObject);
+                    // Return to pool if enabled
+                    if (EpicPool.Enabled && !string.IsNullOrEmpty(view.PrefabName))
+                    {
+                        EpicPool.Return(view.gameObject);
+                    }
+                    else
+                    {
+                        UnityEngine.Object.Destroy(view.gameObject);
+                    }
                 }
             }
         }
@@ -1448,7 +1723,43 @@ namespace EpicNet
                 float latency = Time.time - pingTime;
                 Ping = (int)(latency * 1000f);
                 _playerPingTimes.Remove(senderId);
+
+                // Track ping history for averages
+                _recentPings.Enqueue(Ping);
+                while (_recentPings.Count > 20) // Keep last 20 pings
+                {
+                    _recentPings.Dequeue();
+                }
             }
+        }
+
+        private static void HandleKickReceived(ProductUserId senderId, byte[] data)
+        {
+            // Verify kick came from master client
+            if (_masterClient == null || senderId != _masterClient.UserId)
+            {
+                Debug.LogWarning("EpicNet: Received kick from non-master client, ignoring");
+                return;
+            }
+
+            string reason = "";
+            if (data.Length > 5)
+            {
+                int reasonLength = BitConverter.ToInt32(data, 1);
+                if (data.Length >= 5 + reasonLength)
+                {
+                    reason = System.Text.Encoding.UTF8.GetString(data, 5, reasonLength);
+                }
+            }
+
+            Debug.Log($"EpicNet: Kicked from room: {reason}");
+
+            // Disable auto-reconnect for kicks
+            _wasInRoom = false;
+            _isReconnecting = false;
+
+            OnKicked?.Invoke(reason);
+            LeaveRoom();
         }
 
         private static void HandleInitialStateReceived(ProductUserId senderId, byte[] data)
@@ -1909,21 +2220,26 @@ namespace EpicNet
 
         #region Internal Helper Methods
 
-        private static void SendP2PPacket(ProductUserId targetUserId, byte[] data)
+        private static void SendP2PPacket(ProductUserId targetUserId, byte[] data, bool reliable = true)
         {
             var sendOptions = new SendPacketOptions
             {
                 LocalUserId = _localUserId,
                 RemoteUserId = targetUserId,
                 SocketId = new SocketId { SocketName = "EpicNet" },
-                Channel = 0,
+                Channel = (byte)(reliable ? 0 : 1),
                 Data = new ArraySegment<byte>(data),
-                AllowDelayedDelivery = true,
-                Reliability = PacketReliability.ReliableOrdered
+                AllowDelayedDelivery = reliable,
+                Reliability = reliable ? PacketReliability.ReliableOrdered : PacketReliability.UnreliableUnordered
             };
 
             var result = _p2pInterface.SendPacket(ref sendOptions);
-            if (result != Result.Success)
+            if (result == Result.Success)
+            {
+                _bytesSent += data.Length;
+                _packetsSent++;
+            }
+            else
             {
                 Debug.LogWarning($"EpicNet: Failed to send P2P packet: {result}");
             }
@@ -1966,6 +2282,8 @@ namespace EpicNet
                 _currentLobbyId = data.LobbyId;
                 _currentRoom = new EpicRoom(data.LobbyId, roomName);
                 _isMasterClient = true;
+                _lastRoomName = roomName;
+                _wasInRoom = true;
 
                 _localPlayer.IsMasterClient = true;
                 _masterClient = _localPlayer;
@@ -1974,12 +2292,22 @@ namespace EpicNet
                 // Set room name as attribute
                 SetRoomProperties(new Dictionary<string, object> { { "RoomName", roomName } });
 
+                // Handle reconnection success
+                if (_isReconnecting)
+                {
+                    _isReconnecting = false;
+                    _reconnectAttempts = 0;
+                    Debug.Log("EpicNet: Reconnection successful!");
+                    OnReconnected?.Invoke();
+                }
+
                 Debug.Log($"EpicNet: Room created: {roomName}");
                 OnJoinedRoom?.Invoke();
             }
             else
             {
                 Debug.LogError($"EpicNet: Failed to create room: {data.ResultCode}");
+                HandleReconnectFailure();
             }
         }
 
@@ -1989,6 +2317,34 @@ namespace EpicNet
             var result = lobbyDetails.CopyInfo(ref infoOptions, out LobbyDetailsInfo? lobbyInfo);
 
             if (result != Result.Success || !lobbyInfo.HasValue) return;
+
+            // Check for password protection
+            var passwordAttrOptions = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = "_password" };
+            if (lobbyDetails.CopyAttributeByKey(ref passwordAttrOptions, out Attribute? passwordAttr) == Result.Success && passwordAttr.HasValue)
+            {
+                string storedHash = passwordAttr.Value.Data.Value.Value.AsUtf8;
+
+                if (!string.IsNullOrEmpty(storedHash))
+                {
+                    // Room has a password
+                    if (string.IsNullOrEmpty(_pendingJoinPassword))
+                    {
+                        Debug.LogError("EpicNet: Room requires a password");
+                        OnJoinRoomFailed?.Invoke("Room requires a password");
+                        HandleReconnectFailure();
+                        return;
+                    }
+
+                    string providedHash = HashPassword(_pendingJoinPassword);
+                    if (providedHash != storedHash)
+                    {
+                        Debug.LogError("EpicNet: Incorrect room password");
+                        OnJoinRoomFailed?.Invoke("Incorrect password");
+                        HandleReconnectFailure();
+                        return;
+                    }
+                }
+            }
 
             var joinOptions = new JoinLobbyOptions
             {
@@ -2006,6 +2362,7 @@ namespace EpicNet
                 _currentLobbyId = data.LobbyId;
                 _currentRoom = new EpicRoom(data.LobbyId, "Room");
                 _isMasterClient = false;
+                _wasInRoom = true;
 
                 _localPlayer.IsMasterClient = false;
                 _playerList.Add(_localPlayer);
@@ -2022,12 +2379,22 @@ namespace EpicNet
                     FetchLobbyMembers(lobbyDetails);
                 }
 
+                // Handle reconnection success
+                if (_isReconnecting)
+                {
+                    _isReconnecting = false;
+                    _reconnectAttempts = 0;
+                    Debug.Log("EpicNet: Reconnection successful!");
+                    OnReconnected?.Invoke();
+                }
+
                 Debug.Log($"EpicNet: Joined room: {data.LobbyId}");
                 OnJoinedRoom?.Invoke();
             }
             else
             {
                 Debug.LogError($"EpicNet: Failed to join room: {data.ResultCode}");
+                HandleReconnectFailure();
             }
         }
 
@@ -2108,6 +2475,18 @@ namespace EpicNet
         private static void RegisterNetworkObject(EpicView view)
         {
             _networkObjects[view.ViewID] = view;
+        }
+
+        /// <summary>
+        /// Register a scene object and assign it a view ID
+        /// Scene objects are automatically owned by the master client
+        /// </summary>
+        public static int RegisterSceneObject(EpicView view)
+        {
+            int viewId = GenerateViewID();
+            view.ViewID = viewId;
+            _networkObjects[viewId] = view;
+            return viewId;
         }
 
         public static void UnregisterNetworkObject(int viewId)
@@ -2191,6 +2570,188 @@ namespace EpicNet
             pingData[0] = (byte)PacketType.Ping;
             _playerPingTimes[targetPlayer.UserId] = Time.time;
             SendP2PPacket(targetPlayer.UserId, pingData);
+        }
+
+        /// <summary>
+        /// Kick a player from the room (Master Client only)
+        /// </summary>
+        public static void KickPlayer(EpicPlayer player, string reason = "")
+        {
+            if (!IsMasterClient)
+            {
+                Debug.LogWarning("EpicNet: Only master client can kick players");
+                return;
+            }
+
+            if (player == null || player.UserId == _localUserId)
+            {
+                Debug.LogWarning("EpicNet: Invalid kick target");
+                return;
+            }
+
+            Debug.Log($"EpicNet: Kicking player {player.NickName}: {reason}");
+
+            // Send kick notification
+            byte[] reasonBytes = System.Text.Encoding.UTF8.GetBytes(reason ?? "");
+            byte[] data = new byte[1 + 4 + reasonBytes.Length];
+            data[0] = (byte)PacketType.Kick;
+            BitConverter.GetBytes(reasonBytes.Length).CopyTo(data, 1);
+            reasonBytes.CopyTo(data, 5);
+
+            SendP2PPacket(player.UserId, data);
+
+            // Remove from lobby via EOS
+            var kickOptions = new KickMemberOptions
+            {
+                LobbyId = _currentLobbyId,
+                LocalUserId = _localUserId,
+                TargetUserId = player.UserId
+            };
+
+            _lobbyInterface.KickMember(ref kickOptions, null, (ref KickMemberCallbackInfo callbackInfo) =>
+            {
+                if (callbackInfo.ResultCode == Result.Success)
+                {
+                    Debug.Log($"EpicNet: Successfully kicked {player.NickName}");
+                }
+                else
+                {
+                    Debug.LogWarning($"EpicNet: Failed to kick player: {callbackInfo.ResultCode}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Ban a player from rejoining the room (Master Client only, session-based)
+        /// </summary>
+        public static void BanPlayer(EpicPlayer player, string reason = "")
+        {
+            if (!IsMasterClient)
+            {
+                Debug.LogWarning("EpicNet: Only master client can ban players");
+                return;
+            }
+
+            if (player == null)
+            {
+                Debug.LogWarning("EpicNet: Invalid ban target");
+                return;
+            }
+
+            string oderId = player.UserId.ToString();
+            _bannedPlayerIds.Add(oderId);
+            Debug.Log($"EpicNet: Banned player {player.NickName}");
+
+            // Also kick them
+            KickPlayer(player, reason);
+        }
+
+        /// <summary>
+        /// Unban a player
+        /// </summary>
+        public static void UnbanPlayer(string oderId)
+        {
+            _bannedPlayerIds.Remove(oderId);
+            Debug.Log($"EpicNet: Unbanned player {oderId}");
+        }
+
+        /// <summary>
+        /// Check if a player is banned
+        /// </summary>
+        public static bool IsPlayerBanned(string oderId)
+        {
+            return _bannedPlayerIds.Contains(oderId);
+        }
+
+        /// <summary>
+        /// Clear all bans
+        /// </summary>
+        public static void ClearBans()
+        {
+            _bannedPlayerIds.Clear();
+            Debug.Log("EpicNet: All bans cleared");
+        }
+
+        /// <summary>
+        /// Manually trigger reconnection to the last room
+        /// </summary>
+        public static void Reconnect()
+        {
+            if (!_wasInRoom || string.IsNullOrEmpty(_lastRoomName))
+            {
+                Debug.LogWarning("EpicNet: No previous room to reconnect to");
+                return;
+            }
+
+            if (InRoom)
+            {
+                Debug.LogWarning("EpicNet: Already in a room");
+                return;
+            }
+
+            _isReconnecting = true;
+            _reconnectAttempts = 0;
+            OnReconnecting?.Invoke();
+            Debug.Log($"EpicNet: Attempting to reconnect to room '{_lastRoomName}'...");
+            JoinRoom(_lastRoomName, true);
+        }
+
+        private static void TryAutoReconnect()
+        {
+            if (!AutoReconnect || !_wasInRoom || string.IsNullOrEmpty(_lastRoomName))
+                return;
+
+            if (InRoom || _isReconnecting)
+                return;
+
+            if (_reconnectAttempts >= MaxReconnectAttempts)
+            {
+                Debug.LogWarning("EpicNet: Max reconnection attempts reached");
+                _isReconnecting = false;
+                _wasInRoom = false;
+                OnReconnectFailed?.Invoke();
+                return;
+            }
+
+            if (Time.time - _reconnectAttemptTime < ReconnectDelay)
+                return;
+
+            _isReconnecting = true;
+            _reconnectAttempts++;
+            _reconnectAttemptTime = Time.time;
+
+            OnReconnecting?.Invoke();
+            Debug.Log($"EpicNet: Auto-reconnecting to room '{_lastRoomName}' (attempt {_reconnectAttempts}/{MaxReconnectAttempts})...");
+            JoinRoom(_lastRoomName, true);
+        }
+
+        private static void HandleReconnectFailure()
+        {
+            if (!_isReconnecting) return;
+
+            if (_reconnectAttempts >= MaxReconnectAttempts)
+            {
+                _isReconnecting = false;
+                _wasInRoom = false;
+                Debug.LogError("EpicNet: Reconnection failed after max attempts");
+                OnReconnectFailed?.Invoke();
+            }
+            else
+            {
+                // Will retry on next Update cycle
+                _reconnectAttemptTime = Time.time;
+                Debug.Log($"EpicNet: Reconnection attempt failed, will retry...");
+            }
+        }
+
+        /// <summary>
+        /// Cancel any ongoing reconnection attempts
+        /// </summary>
+        public static void CancelReconnect()
+        {
+            _isReconnecting = false;
+            _reconnectAttempts = 0;
+            Debug.Log("EpicNet: Reconnection cancelled");
         }
 
         #endregion

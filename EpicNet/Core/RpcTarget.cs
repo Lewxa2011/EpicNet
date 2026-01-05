@@ -19,6 +19,10 @@ namespace EpicNet
         AllBuffered,
         OthersBuffered,
         AllViaServer,
-        AllBufferedViaServer
+        AllBufferedViaServer,
+        // Unreliable variants - use for frequent, non-critical updates
+        AllUnreliable,
+        OthersUnreliable,
+        MasterClientUnreliable
     }
 }

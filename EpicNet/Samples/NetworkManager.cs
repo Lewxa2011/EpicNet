@@ -53,7 +53,7 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
     {
         EpicNetwork.NickName = cachedName;
         EpicNetwork.ConnectUsingSettings();
-        EpicNetwork.JoinRandomRoom();
+        EpicNetwork.JoinRoom("Diddy");
     }
 
     public override void OnConnectedToMaster()

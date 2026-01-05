@@ -36,7 +36,7 @@ namespace EpicNet
         private float[] _floatOut = new float[FRAME_SIZE];
         private byte[] _opusPacket = new byte[MAX_OPUS_PACKET_SIZE];
 
-        const float VAD_THRESHOLD = 0.015f;   // adjust if needed
+        const float VAD_THRESHOLD = 0.07f;   // adjust if needed
         const int VAD_SAMPLES = 256;
 
         private float[] _vadBuffer = new float[VAD_SAMPLES];
@@ -67,12 +67,15 @@ namespace EpicNet
                     SignalType = OpusSignal.OPUS_SIGNAL_VOICE
                 };
 
-                _micClip = Microphone.Start(
-                    EpicVCMgr.CurrentDevice,
-                    true,
-                    1,
-                    (int)SR
-                );
+                // On Android, wait for permission before starting microphone
+                if (EpicVCMgr.IsInitialized && EpicVCMgr.HasMicrophonePermission)
+                {
+                    StartMicrophone();
+                }
+                else
+                {
+                    EpicVCMgr.OnInitialized += StartMicrophone;
+                }
             }
             else
             {
@@ -90,6 +93,26 @@ namespace EpicNet
             }
         }
 
+        private void StartMicrophone()
+        {
+            EpicVCMgr.OnInitialized -= StartMicrophone;
+
+            if (!EpicVCMgr.HasMicrophonePermission)
+            {
+                Debug.LogWarning("EpicNet VC: Cannot start microphone - permission not granted");
+                return;
+            }
+
+            _micClip = Microphone.Start(
+                EpicVCMgr.CurrentDevice,
+                true,
+                1,
+                (int)SR
+            );
+
+            Debug.Log("EpicNet VC: Microphone started");
+        }
+
         private void OnDestroy()
         {
             Cleanup();
@@ -102,6 +125,8 @@ namespace EpicNet
 
         private void Cleanup()
         {
+            EpicVCMgr.OnInitialized -= StartMicrophone;
+
             if (_view.IsMine)
             {
                 if (Microphone.IsRecording(EpicVCMgr.CurrentDevice))
