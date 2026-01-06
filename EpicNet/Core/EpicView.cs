@@ -17,7 +17,6 @@ namespace EpicNet
         [SerializeField] private OwnershipOption ownershipTransfer = OwnershipOption.Takeover;
         [SerializeField] private ViewSynchronization synchronization = ViewSynchronization.ReliableDeltaCompressed;
 
-        private Action<int, EpicPlayer> _pendingOwnershipRequest;
         private bool _registeredForRoomJoin;
 
         private void Awake()
@@ -77,6 +76,12 @@ namespace EpicNet
                 return;
             }
 
+            if (newOwner == null)
+            {
+                Debug.LogWarning("EpicNet: Cannot transfer ownership to null player");
+                return;
+            }
+
             var oldOwner = Owner;
             Owner = newOwner;
 
@@ -105,6 +110,13 @@ namespace EpicNet
             }
             else if (ownershipTransfer == OwnershipOption.Request)
             {
+                if (Owner == null)
+                {
+                    Debug.LogWarning("EpicNet: Cannot request ownership - current owner is null, taking ownership");
+                    TransferOwnership(EpicNetwork.LocalPlayer);
+                    return;
+                }
+
                 Debug.Log($"EpicNet: Requesting ownership from {Owner.NickName}...");
 
                 // Send ownership request to the current owner

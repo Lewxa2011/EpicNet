@@ -19,7 +19,7 @@ namespace EpicNet
         public Dictionary<string, object> CustomProperties { get; private set; }
         public List<EpicPlayer> Players { get; private set; }
 
-        public EpicRoom(string name, string displayName)
+        public EpicRoom(string name)
         {
             Name = name;
             CustomProperties = new Dictionary<string, object>();

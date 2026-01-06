@@ -82,6 +82,14 @@ namespace EpicNet
         // Kick/Ban system
         private static HashSet<string> _bannedPlayerIds = new HashSet<string>();
 
+        // Delayed callbacks (replaces GameObject-based approach)
+        private static List<DelayedAction> _delayedActions = new List<DelayedAction>();
+        private struct DelayedAction
+        {
+            public float TriggerTime;
+            public Action Callback;
+        }
+
         // Room password
         private static string _currentRoomPassword;
         private static string _pendingJoinPassword;
@@ -346,12 +354,25 @@ namespace EpicNet
 
             _localUserId = null;
             _isConnected = false;
+            _isMasterClient = false;
             _localPlayer = null;
             _masterClient = null;
+            _currentRoom = null;
+            _currentLobbyId = null;
+            _playerList.Clear();
             _networkObjects.Clear();
             _bufferedRPCs.Clear();
             _ownershipRequestCallbacks.Clear();
             _pendingInitialState.Clear();
+            _delayedActions.Clear();
+
+            // Reset reconnection state
+            _wasInRoom = false;
+            _isReconnecting = false;
+            _reconnectAttempts = 0;
+
+            // Reset actor counter for fresh session
+            EpicPlayer.ResetActorCounter();
 
             Debug.Log("EpicNet: Logged out");
         }
@@ -490,6 +511,9 @@ namespace EpicNet
         {
             if (userId == _localUserId) return;
 
+            // Check if player already exists in list
+            if (_playerList.Any(p => p.UserId == userId)) return;
+
             var player = new EpicPlayer(userId, $"Player_{userId}");
 
             // Check if player is banned (master client only)
@@ -538,14 +562,20 @@ namespace EpicNet
         private static void CleanupPlayerObjects(EpicPlayer player)
         {
             var objectsToDestroy = _networkObjects.Values
-                .Where(v => v.Owner?.UserId == player.UserId)
+                .Where(v => v != null && v.Owner?.UserId == player.UserId)
                 .ToList();
 
             foreach (var view in objectsToDestroy)
             {
-                if (view != null && view.gameObject != null)
+                if (view != null)
                 {
-                    UnityEngine.Object.Destroy(view.gameObject);
+                    // Unregister the object
+                    UnregisterNetworkObject(view.ViewID);
+
+                    if (view.gameObject != null)
+                    {
+                        UnityEngine.Object.Destroy(view.gameObject);
+                    }
                 }
             }
         }
@@ -553,6 +583,15 @@ namespace EpicNet
         private static void PerformHostMigration()
         {
             Debug.Log("EpicNet: Performing host migration...");
+
+            // Handle empty player list case
+            if (_playerList == null || _playerList.Count == 0)
+            {
+                Debug.LogWarning("EpicNet: No players remaining for host migration");
+                _masterClient = null;
+                _isMasterClient = false;
+                return;
+            }
 
             // Find new master client (player with lowest actor number)
             var newMaster = _playerList.OrderBy(p => p.ActorNumber).FirstOrDefault();
@@ -585,16 +624,34 @@ namespace EpicNet
 
                 OnMasterClientSwitched?.Invoke(_masterClient);
             }
+            else
+            {
+                Debug.LogWarning("EpicNet: Could not determine new master client");
+                _masterClient = null;
+                _isMasterClient = false;
+                if (_localPlayer != null)
+                {
+                    _localPlayer.IsMasterClient = false;
+                }
+            }
         }
 
         private static void TakeOwnershipOfOrphanedObjects()
         {
-            foreach (var view in _networkObjects.Values)
+            // Use ToList() to avoid modification during iteration
+            var views = _networkObjects.Values.ToList();
+
+            foreach (var view in views)
             {
+                if (view == null || view.gameObject == null) continue;
+
                 if (view.Owner == null || !_playerList.Any(p => p.UserId == view.Owner.UserId))
                 {
                     view.Owner = _localPlayer;
                     Debug.Log($"EpicNet: Took ownership of orphaned object {view.ViewID}");
+
+                    // Notify other players about the ownership transfer
+                    SendOwnershipTransfer(view.ViewID, _localPlayer);
                 }
             }
         }
@@ -760,6 +817,7 @@ namespace EpicNet
 
                 _lobbyInterface.UpdateLobby(ref updateOptions, null, (ref UpdateLobbyCallbackInfo callbackInfo) =>
                 {
+                    lobbyModification.Release();
                     if (callbackInfo.ResultCode == Result.Success)
                     {
                         _currentRoom.CustomProperties[kvp.Key] = kvp.Value;
@@ -840,6 +898,7 @@ namespace EpicNet
                 if (data.ResultCode != Result.Success)
                 {
                     Debug.LogError($"EpicNet: Lobby search failed: {data.ResultCode}");
+                    outSearchHandle.Release();
                     return;
                 }
 
@@ -859,9 +918,11 @@ namespace EpicNet
                         {
                             _cachedRoomList.Add(roomInfo);
                         }
+                        lobbyDetails.Release();
                     }
                 }
 
+                outSearchHandle.Release();
                 OnRoomListUpdate?.Invoke(_cachedRoomList);
                 Debug.Log($"EpicNet: Found {_cachedRoomList.Count} rooms");
             });
@@ -878,7 +939,7 @@ namespace EpicNet
             var roomInfo = new EpicRoomInfo
             {
                 Name = lobbyInfo.Value.LobbyId,
-                PlayerCount = (int)lobbyInfo.Value.AvailableSlots,
+                PlayerCount = (int)(lobbyInfo.Value.MaxMembers - lobbyInfo.Value.AvailableSlots),
                 MaxPlayers = (int)lobbyInfo.Value.MaxMembers,
                 IsOpen = true
             };
@@ -927,6 +988,7 @@ namespace EpicNet
                 if (data.ResultCode != Result.Success)
                 {
                     Debug.LogError($"EpicNet: Lobby search failed: {data.ResultCode}");
+                    outSearchHandle.Release();
 
                     if (createIfNoneAvailable)
                     {
@@ -948,6 +1010,7 @@ namespace EpicNet
                     if (result == Result.Success)
                     {
                         JoinLobby(lobbyDetails);
+                        lobbyDetails.Release();
                     }
                 }
                 else
@@ -960,6 +1023,8 @@ namespace EpicNet
                         CreateRoom(CreateRoomName());
                     }
                 }
+
+                outSearchHandle.Release();
             });
         }
 
@@ -1041,6 +1106,7 @@ namespace EpicNet
                 if (data.ResultCode != Result.Success)
                 {
                     Debug.LogError($"EpicNet: Lobby search failed: {data.ResultCode}");
+                    lobbySearch.Release();
                     return;
                 }
 
@@ -1050,6 +1116,7 @@ namespace EpicNet
                 if (resultCount == 0)
                 {
                     Debug.Log($"EpicNet: No room found with name '{roomName}'");
+                    lobbySearch.Release();
                     if (createFallback) CreateRoom(roomName);
                     return;
                 }
@@ -1063,11 +1130,14 @@ namespace EpicNet
                 if (copyResult != Result.Success)
                 {
                     Debug.LogError($"EpicNet: Failed to copy lobby result: {copyResult}");
+                    lobbySearch.Release();
                     return;
                 }
 
                 Debug.Log($"EpicNet: Joining room '{roomName}'");
                 JoinLobby(lobbyDetails);
+                lobbyDetails.Release();
+                lobbySearch.Release();
             });
         }
 
@@ -1253,6 +1323,10 @@ namespace EpicNet
                     {
                         SendP2PPacket(_masterClient.UserId, rpcData, !unreliable);
                     }
+                    else
+                    {
+                        Debug.LogWarning($"EpicNet: Cannot send RPC '{methodName}' to MasterClient - master client is null");
+                    }
                     break;
             }
         }
@@ -1362,6 +1436,9 @@ namespace EpicNet
         /// </summary>
         public static void Update()
         {
+            // Process delayed callbacks
+            ProcessDelayedActions();
+
             // Handle auto-reconnection when not in room
             if (!InRoom)
             {
@@ -1383,14 +1460,45 @@ namespace EpicNet
             }
         }
 
+        private static void ProcessDelayedActions()
+        {
+            for (int i = _delayedActions.Count - 1; i >= 0; i--)
+            {
+                if (Time.time >= _delayedActions[i].TriggerTime)
+                {
+                    _delayedActions[i].Callback?.Invoke();
+                    _delayedActions.RemoveAt(i);
+                }
+            }
+        }
+
         private static void SyncObservables()
         {
-            foreach (var view in _networkObjects.Values)
-            {
-                if (view == null || !view.IsMine) continue;
+            // Use ToList() to avoid modification during iteration if objects are destroyed
+            var views = _networkObjects.Values.ToList();
 
-                var observables = view.GetComponents<IEpicObservable>();
-                if (observables.Length == 0) continue;
+            foreach (var view in views)
+            {
+                // Check for null view, destroyed gameObject, or not owned by us
+                if (view == null || view.gameObject == null || !view.IsMine) continue;
+
+                IEpicObservable[] observables;
+                try
+                {
+                    observables = view.GetComponents<IEpicObservable>();
+                }
+                catch (MissingReferenceException)
+                {
+                    // Object was destroyed during iteration
+                    continue;
+                }
+                catch (NullReferenceException)
+                {
+                    // Object reference became null
+                    continue;
+                }
+
+                if (observables == null || observables.Length == 0) continue;
 
                 // Create write stream
                 var stream = new EpicStream(true);
@@ -1403,6 +1511,7 @@ namespace EpicNet
                 // Serialize all observables
                 foreach (var observable in observables)
                 {
+                    if (observable == null) continue;
                     observable.OnEpicSerializeView(stream, messageInfo);
                 }
 
@@ -1605,6 +1714,9 @@ namespace EpicNet
 
             if (_networkObjects.TryGetValue(viewId, out EpicView view))
             {
+                // Check for destroyed objects
+                if (view == null || view.gameObject == null) return;
+
                 var stream = new EpicStream(false);
                 DeserializeObservableStream(data, 5, stream);
 
@@ -1614,9 +1726,25 @@ namespace EpicNet
                     Timestamp = Time.timeAsDouble
                 };
 
-                var observables = view.GetComponents<IEpicObservable>();
+                IEpicObservable[] observables;
+                try
+                {
+                    observables = view.GetComponents<IEpicObservable>();
+                }
+                catch (MissingReferenceException)
+                {
+                    // Object destroyed
+                    return;
+                }
+                catch (NullReferenceException)
+                {
+                    // Object reference became null
+                    return;
+                }
+
                 foreach (var observable in observables)
                 {
+                    if (observable == null) continue;
                     observable.OnEpicSerializeView(stream, messageInfo);
                 }
             }
@@ -1677,7 +1805,21 @@ namespace EpicNet
                 if (view != null)
                 {
                     view.ViewID = viewId;
-                    view.Owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+
+                    // Try to find owner in player list
+                    var owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+
+                    // Fallback: use sender as owner if owner not found
+                    if (owner == null)
+                    {
+                        owner = _playerList.Find(p => p.UserId == senderId);
+                        if (owner == null)
+                        {
+                            Debug.LogWarning($"EpicNet: Owner not found for instantiated object {viewId}, using null owner");
+                        }
+                    }
+
+                    view.Owner = owner;
                     view.PrefabName = prefabName;
                     RegisterNetworkObject(view);
                 }
@@ -1804,17 +1946,35 @@ namespace EpicNet
                 string ownerIdString = System.Text.Encoding.UTF8.GetString(data, offset, ownerIdLength);
                 offset += ownerIdLength;
 
-                // Instantiate
-                GameObject prefab = Resources.Load<GameObject>(prefabName);
-                if (prefab != null)
+                // Instantiate using pool if enabled
+                GameObject obj;
+                if (EpicPool.Enabled)
                 {
-                    GameObject obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
+                    obj = EpicPool.Get(prefabName, position, rotation);
+                }
+                else
+                {
+                    GameObject prefab = Resources.Load<GameObject>(prefabName);
+                    if (prefab == null) continue;
+                    obj = UnityEngine.Object.Instantiate(prefab, position, rotation);
+                }
+
+                if (obj != null)
+                {
                     var view = obj.GetComponent<EpicView>();
 
                     if (view != null)
                     {
                         view.ViewID = viewId;
-                        view.Owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+
+                        // Try to find owner in player list, fallback to sender
+                        var owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+                        if (owner == null)
+                        {
+                            owner = _playerList.Find(p => p.UserId == senderId);
+                        }
+
+                        view.Owner = owner;
                         view.PrefabName = prefabName;
                         RegisterNetworkObject(view);
                     }
@@ -1956,21 +2116,22 @@ namespace EpicNet
 
         private static byte[] SerializeRPC(int viewId, string methodName, object[] parameters, int rpcId, RpcTarget target)
         {
-            var stream = new System.IO.MemoryStream();
-            var writer = new System.IO.BinaryWriter(stream);
-
-            writer.Write((byte)PacketType.RPC);
-            writer.Write(viewId);
-            writer.Write(methodName.Length);
-            writer.Write(System.Text.Encoding.UTF8.GetBytes(methodName));
-            writer.Write(parameters.Length);
-
-            foreach (var param in parameters)
+            using (var stream = new System.IO.MemoryStream())
+            using (var writer = new System.IO.BinaryWriter(stream))
             {
-                SerializeParameter(writer, param);
-            }
+                writer.Write((byte)PacketType.RPC);
+                writer.Write(viewId);
+                writer.Write(methodName.Length);
+                writer.Write(System.Text.Encoding.UTF8.GetBytes(methodName));
+                writer.Write(parameters.Length);
 
-            return stream.ToArray();
+                foreach (var param in parameters)
+                {
+                    SerializeParameter(writer, param);
+                }
+
+                return stream.ToArray();
+            }
         }
 
         private static void SerializeParameter(System.IO.BinaryWriter writer, object param)
@@ -2041,6 +2202,13 @@ namespace EpicNet
 
         private static object DeserializeParameter(byte[] data, ref int offset)
         {
+            // Validate we have at least 1 byte for type
+            if (offset >= data.Length)
+            {
+                Debug.LogWarning("EpicNet: Buffer underflow in DeserializeParameter - no type byte");
+                return null;
+            }
+
             byte typeId = data[offset++];
 
             switch (typeId)
@@ -2049,27 +2217,57 @@ namespace EpicNet
                     return null;
 
                 case 1: // int
+                    if (offset + 4 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading int");
+                        return null;
+                    }
                     int intVal = BitConverter.ToInt32(data, offset);
                     offset += 4;
                     return intVal;
 
                 case 2: // float
+                    if (offset + 4 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading float");
+                        return null;
+                    }
                     float floatVal = BitConverter.ToSingle(data, offset);
                     offset += 4;
                     return floatVal;
 
                 case 3: // string
+                    if (offset + 4 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading string length");
+                        return null;
+                    }
                     int strLength = BitConverter.ToInt32(data, offset);
                     offset += 4;
+                    if (strLength < 0 || offset + strLength > data.Length)
+                    {
+                        Debug.LogWarning($"EpicNet: Invalid string length {strLength} or buffer underflow");
+                        return null;
+                    }
                     string strVal = System.Text.Encoding.UTF8.GetString(data, offset, strLength);
                     offset += strLength;
                     return strVal;
 
                 case 4: // bool
+                    if (offset >= data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading bool");
+                        return null;
+                    }
                     bool boolVal = data[offset++] == 1;
                     return boolVal;
 
                 case 5: // Vector3
+                    if (offset + 12 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading Vector3");
+                        return null;
+                    }
                     Vector3 vec = new Vector3(
                         BitConverter.ToSingle(data, offset),
                         BitConverter.ToSingle(data, offset + 4),
@@ -2079,6 +2277,11 @@ namespace EpicNet
                     return vec;
 
                 case 6: // Quaternion
+                    if (offset + 16 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading Quaternion");
+                        return null;
+                    }
                     Quaternion quat = new Quaternion(
                         BitConverter.ToSingle(data, offset),
                         BitConverter.ToSingle(data, offset + 4),
@@ -2089,36 +2292,48 @@ namespace EpicNet
                     return quat;
 
                 case 7: // byte[]
+                    if (offset + 4 > data.Length)
+                    {
+                        Debug.LogWarning("EpicNet: Buffer underflow reading byte[] length");
+                        return null;
+                    }
                     int byteLength = BitConverter.ToInt32(data, offset);
                     offset += 4;
+                    if (byteLength < 0 || offset + byteLength > data.Length)
+                    {
+                        Debug.LogWarning($"EpicNet: Invalid byte[] length {byteLength} or buffer underflow");
+                        return null;
+                    }
                     byte[] byteArray = new byte[byteLength];
                     Array.Copy(data, offset, byteArray, 0, byteLength);
                     offset += byteLength;
                     return byteArray;
 
                 default:
+                    Debug.LogWarning($"EpicNet: Unknown parameter type {typeId}");
                     return null;
             }
         }
 
         private static byte[] SerializeObservableData(int viewId, EpicStream stream)
         {
-            var memStream = new System.IO.MemoryStream();
-            var writer = new System.IO.BinaryWriter(memStream);
-
-            writer.Write((byte)PacketType.ObservableData);
-            writer.Write(viewId);
-
-            // Write stream data
-            var dataList = stream.GetDataList();
-            writer.Write(dataList.Count);
-
-            foreach (var item in dataList)
+            using (var memStream = new System.IO.MemoryStream())
+            using (var writer = new System.IO.BinaryWriter(memStream))
             {
-                SerializeParameter(writer, item);
-            }
+                writer.Write((byte)PacketType.ObservableData);
+                writer.Write(viewId);
 
-            return memStream.ToArray();
+                // Write stream data
+                var dataList = stream.GetDataList();
+                writer.Write(dataList.Count);
+
+                foreach (var item in dataList)
+                {
+                    SerializeParameter(writer, item);
+                }
+
+                return memStream.ToArray();
+            }
         }
 
         private static void DeserializeObservableStream(byte[] data, int startOffset, EpicStream stream)
@@ -2136,26 +2351,27 @@ namespace EpicNet
 
         private static byte[] SerializeInstantiateMessage(int viewId, string prefabName, Vector3 position, Quaternion rotation, EpicPlayer owner)
         {
-            var stream = new System.IO.MemoryStream();
-            var writer = new System.IO.BinaryWriter(stream);
+            using (var stream = new System.IO.MemoryStream())
+            using (var writer = new System.IO.BinaryWriter(stream))
+            {
+                writer.Write((byte)PacketType.InstantiateObject);
+                writer.Write(viewId);
+                writer.Write(prefabName.Length);
+                writer.Write(System.Text.Encoding.UTF8.GetBytes(prefabName));
+                writer.Write(position.x);
+                writer.Write(position.y);
+                writer.Write(position.z);
+                writer.Write(rotation.x);
+                writer.Write(rotation.y);
+                writer.Write(rotation.z);
+                writer.Write(rotation.w);
 
-            writer.Write((byte)PacketType.InstantiateObject);
-            writer.Write(viewId);
-            writer.Write(prefabName.Length);
-            writer.Write(System.Text.Encoding.UTF8.GetBytes(prefabName));
-            writer.Write(position.x);
-            writer.Write(position.y);
-            writer.Write(position.z);
-            writer.Write(rotation.x);
-            writer.Write(rotation.y);
-            writer.Write(rotation.z);
-            writer.Write(rotation.w);
+                byte[] ownerIdBytes = System.Text.Encoding.UTF8.GetBytes(owner.UserId.ToString());
+                writer.Write(ownerIdBytes.Length);
+                writer.Write(ownerIdBytes);
 
-            byte[] ownerIdBytes = System.Text.Encoding.UTF8.GetBytes(owner.UserId.ToString());
-            writer.Write(ownerIdBytes.Length);
-            writer.Write(ownerIdBytes);
-
-            return stream.ToArray();
+                return stream.ToArray();
+            }
         }
 
         private static byte[] SerializeDestroyMessage(int viewId)
@@ -2168,52 +2384,55 @@ namespace EpicNet
 
         private static byte[] SerializeInitialState()
         {
-            var stream = new System.IO.MemoryStream();
-            var writer = new System.IO.BinaryWriter(stream);
-
-            writer.Write((byte)PacketType.InitialState);
-
-            // Serialize all network objects
-            writer.Write(_networkObjects.Count);
-
-            foreach (var kvp in _networkObjects)
+            using (var stream = new System.IO.MemoryStream())
+            using (var writer = new System.IO.BinaryWriter(stream))
             {
-                var view = kvp.Value;
-                if (view == null) continue;
+                writer.Write((byte)PacketType.InitialState);
 
-                writer.Write(view.ViewID);
-                writer.Write(view.PrefabName.Length);
-                writer.Write(System.Text.Encoding.UTF8.GetBytes(view.PrefabName));
-                writer.Write(view.transform.position.x);
-                writer.Write(view.transform.position.y);
-                writer.Write(view.transform.position.z);
-                writer.Write(view.transform.rotation.x);
-                writer.Write(view.transform.rotation.y);
-                writer.Write(view.transform.rotation.z);
-                writer.Write(view.transform.rotation.w);
+                // Filter valid network objects first
+                var validObjects = _networkObjects.Values
+                    .Where(v => v != null && v.Owner != null && v.Owner.UserId != null && !string.IsNullOrEmpty(v.PrefabName))
+                    .ToList();
 
-                byte[] ownerIdBytes = System.Text.Encoding.UTF8.GetBytes(view.Owner.UserId.ToString());
-                writer.Write(ownerIdBytes.Length);
-                writer.Write(ownerIdBytes);
-            }
+                // Serialize all valid network objects
+                writer.Write(validObjects.Count);
 
-            // Serialize buffered RPCs
-            writer.Write(_bufferedRPCs.Count);
-
-            foreach (var rpc in _bufferedRPCs)
-            {
-                writer.Write(rpc.ViewID);
-                writer.Write(rpc.MethodName.Length);
-                writer.Write(System.Text.Encoding.UTF8.GetBytes(rpc.MethodName));
-                writer.Write(rpc.Parameters.Length);
-
-                foreach (var param in rpc.Parameters)
+                foreach (var view in validObjects)
                 {
-                    SerializeParameter(writer, param);
-                }
-            }
+                    writer.Write(view.ViewID);
+                    writer.Write(view.PrefabName.Length);
+                    writer.Write(System.Text.Encoding.UTF8.GetBytes(view.PrefabName));
+                    writer.Write(view.transform.position.x);
+                    writer.Write(view.transform.position.y);
+                    writer.Write(view.transform.position.z);
+                    writer.Write(view.transform.rotation.x);
+                    writer.Write(view.transform.rotation.y);
+                    writer.Write(view.transform.rotation.z);
+                    writer.Write(view.transform.rotation.w);
 
-            return stream.ToArray();
+                    byte[] ownerIdBytes = System.Text.Encoding.UTF8.GetBytes(view.Owner.UserId.ToString());
+                    writer.Write(ownerIdBytes.Length);
+                    writer.Write(ownerIdBytes);
+                }
+
+                // Serialize buffered RPCs
+                writer.Write(_bufferedRPCs.Count);
+
+                foreach (var rpc in _bufferedRPCs)
+                {
+                    writer.Write(rpc.ViewID);
+                    writer.Write(rpc.MethodName.Length);
+                    writer.Write(System.Text.Encoding.UTF8.GetBytes(rpc.MethodName));
+                    writer.Write(rpc.Parameters.Length);
+
+                    foreach (var param in rpc.Parameters)
+                    {
+                        SerializeParameter(writer, param);
+                    }
+                }
+
+                return stream.ToArray();
+            }
         }
 
         #endregion
@@ -2247,32 +2466,11 @@ namespace EpicNet
 
         private static void DelayedCallback(float delay, Action callback)
         {
-            var go = new GameObject("DelayedCallback");
-            var mb = go.AddComponent<DelayedCallbackHelper>();
-            mb.Initialize(delay, callback);
-        }
-
-        private class DelayedCallbackHelper : MonoBehaviour
-        {
-            private float _delay;
-            private Action _callback;
-            private float _startTime;
-
-            public void Initialize(float delay, Action callback)
+            _delayedActions.Add(new DelayedAction
             {
-                _delay = delay;
-                _callback = callback;
-                _startTime = Time.time;
-            }
-
-            private void Update()
-            {
-                if (Time.time - _startTime >= _delay)
-                {
-                    _callback?.Invoke();
-                    Destroy(gameObject);
-                }
-            }
+                TriggerTime = Time.time + delay,
+                Callback = callback
+            });
         }
 
         private static void OnLobbyCreated(ref CreateLobbyCallbackInfo data, string roomName)
@@ -2280,7 +2478,7 @@ namespace EpicNet
             if (data.ResultCode == Result.Success)
             {
                 _currentLobbyId = data.LobbyId;
-                _currentRoom = new EpicRoom(data.LobbyId, roomName);
+                _currentRoom = new EpicRoom(data.LobbyId);
                 _isMasterClient = true;
                 _lastRoomName = roomName;
                 _wasInRoom = true;
@@ -2360,23 +2558,32 @@ namespace EpicNet
             if (data.ResultCode == Result.Success)
             {
                 _currentLobbyId = data.LobbyId;
-                _currentRoom = new EpicRoom(data.LobbyId, "Room");
-                _isMasterClient = false;
+                _currentRoom = new EpicRoom(data.LobbyId);
                 _wasInRoom = true;
 
+                // Initialize master client state as false - FetchLobbyMembers will correct if needed
+                _isMasterClient = false;
                 _localPlayer.IsMasterClient = false;
+                _masterClient = null;
+
                 _playerList.Add(_localPlayer);
 
-                // Copy lobby details to fetch members
-                var copyOptions = new CopyLobbyDetailsHandleByInviteIdOptions
+                // Copy lobby details to fetch members using the correct method
+                var copyOptions = new CopyLobbyDetailsHandleOptions
                 {
-                    InviteId = data.LobbyId
+                    LobbyId = data.LobbyId,
+                    LocalUserId = _localUserId
                 };
 
-                var result = _lobbyInterface.CopyLobbyDetailsHandleByInviteId(ref copyOptions, out LobbyDetails lobbyDetails);
+                var result = _lobbyInterface.CopyLobbyDetailsHandle(ref copyOptions, out LobbyDetails lobbyDetails);
                 if (result == Result.Success && lobbyDetails != null)
                 {
                     FetchLobbyMembers(lobbyDetails);
+                    lobbyDetails.Release();
+                }
+                else
+                {
+                    Debug.LogWarning($"EpicNet: Could not copy lobby details: {result}. Master client status may be incorrect.");
                 }
 
                 // Handle reconnection success
@@ -2406,6 +2613,25 @@ namespace EpicNet
                 return;
             }
 
+            // First, get the lobby owner ID
+            var infoOptions = new LobbyDetailsCopyInfoOptions();
+            var infoResult = lobbyDetails.CopyInfo(ref infoOptions, out LobbyDetailsInfo? lobbyInfo);
+            ProductUserId ownerId = null;
+
+            if (infoResult == Result.Success && lobbyInfo.HasValue)
+            {
+                ownerId = lobbyInfo.Value.LobbyOwnerUserId;
+
+                // Check if we (local player) are the lobby owner
+                if (ownerId == _localUserId)
+                {
+                    _isMasterClient = true;
+                    _localPlayer.IsMasterClient = true;
+                    _masterClient = _localPlayer;
+                    Debug.Log("EpicNet: Local player is the lobby owner (master client)");
+                }
+            }
+
             var countOptions = new LobbyDetailsGetMemberCountOptions();
             uint memberCount = lobbyDetails.GetMemberCount(ref countOptions);
 
@@ -2418,26 +2644,18 @@ namespace EpicNet
 
                 ProductUserId memberId = lobbyDetails.GetMemberByIndex(ref memberOptions);
 
-                // Skip ourselves
+                // Skip ourselves (already added)
                 if (memberId == _localUserId) continue;
 
                 // Add other players
                 var player = new EpicPlayer(memberId, $"Player_{memberId}");
 
                 // Check if this member is the lobby owner
-                var infoOptions = new LobbyDetailsCopyInfoOptions();
-                var infoResult = lobbyDetails.CopyInfo(ref infoOptions, out LobbyDetailsInfo? lobbyInfo);
-
-                if (infoResult == Result.Success && lobbyInfo.HasValue)
+                if (ownerId != null && memberId == ownerId)
                 {
-                    ProductUserId ownerId = lobbyInfo.Value.LobbyOwnerUserId;
-
-                    if (memberId == ownerId)
-                    {
-                        player.IsMasterClient = true;
-                        _masterClient = player;
-                        Debug.Log($"EpicNet: Found master client: {player.NickName}");
-                    }
+                    player.IsMasterClient = true;
+                    _masterClient = player;
+                    Debug.Log($"EpicNet: Found master client: {player.NickName}");
                 }
 
                 _playerList.Add(player);
@@ -2449,6 +2667,14 @@ namespace EpicNet
                 var firstPlayer = _playerList[0];
                 firstPlayer.IsMasterClient = true;
                 _masterClient = firstPlayer;
+
+                // Update _isMasterClient if the first player is us
+                if (firstPlayer.UserId == _localUserId)
+                {
+                    _isMasterClient = true;
+                }
+
+                Debug.Log($"EpicNet: No owner found, using first player as master: {firstPlayer.NickName}");
             }
         }
 
@@ -2460,10 +2686,20 @@ namespace EpicNet
                 _currentLobbyId = null;
                 _isMasterClient = false;
                 _masterClient = null;
+
+                // Clear local player's master status
+                if (_localPlayer != null)
+                {
+                    _localPlayer.IsMasterClient = false;
+                }
+
                 _playerList.Clear();
                 _networkObjects.Clear();
                 _bufferedRPCs.Clear();
-                _pendingInitialState.Clear(); // ADD THIS LINE
+                _pendingInitialState.Clear();
+
+                // Reset actor counter for next room
+                EpicPlayer.ResetActorCounter();
 
                 Debug.Log("EpicNet: Left room");
                 OnLeftRoom?.Invoke();
@@ -2548,6 +2784,7 @@ namespace EpicNet
 
                 _lobbyInterface.UpdateLobby(ref updateOptions, null, (ref UpdateLobbyCallbackInfo callbackInfo) =>
                 {
+                    lobbyModification.Release();
                     if (callbackInfo.ResultCode == Result.Success)
                     {
                         _localPlayer.CustomProperties[kvp.Key] = kvp.Value;
@@ -2638,8 +2875,8 @@ namespace EpicNet
                 return;
             }
 
-            string oderId = player.UserId.ToString();
-            _bannedPlayerIds.Add(oderId);
+            string playerId = player.UserId.ToString();
+            _bannedPlayerIds.Add(playerId);
             Debug.Log($"EpicNet: Banned player {player.NickName}");
 
             // Also kick them
@@ -2647,20 +2884,20 @@ namespace EpicNet
         }
 
         /// <summary>
-        /// Unban a player
+        /// Unban a player by their user ID string
         /// </summary>
-        public static void UnbanPlayer(string oderId)
+        public static void UnbanPlayer(string playerId)
         {
-            _bannedPlayerIds.Remove(oderId);
-            Debug.Log($"EpicNet: Unbanned player {oderId}");
+            _bannedPlayerIds.Remove(playerId);
+            Debug.Log($"EpicNet: Unbanned player {playerId}");
         }
 
         /// <summary>
-        /// Check if a player is banned
+        /// Check if a player is banned by their user ID string
         /// </summary>
-        public static bool IsPlayerBanned(string oderId)
+        public static bool IsPlayerBanned(string playerId)
         {
-            return _bannedPlayerIds.Contains(oderId);
+            return _bannedPlayerIds.Contains(playerId);
         }
 
         /// <summary>

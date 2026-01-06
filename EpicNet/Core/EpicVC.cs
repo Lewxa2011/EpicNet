@@ -127,7 +127,7 @@ namespace EpicNet
         {
             EpicVCMgr.OnInitialized -= StartMicrophone;
 
-            if (_view.IsMine)
+            if (_view != null && _view.IsMine)
             {
                 if (Microphone.IsRecording(EpicVCMgr.CurrentDevice))
                     Microphone.End(EpicVCMgr.CurrentDevice);
@@ -230,17 +230,25 @@ namespace EpicNet
 
                     if (decodedSamples <= samplesLeft)
                     {
-                        // Single contiguous write
-                        audioSource.clip.SetData(_floatOut, _playbackWritePos);
+                        // Single contiguous write - create correctly sized array
+                        float[] writeBuffer = new float[decodedSamples];
+                        Array.Copy(_floatOut, 0, writeBuffer, 0, decodedSamples);
+                        audioSource.clip.SetData(writeBuffer, _playbackWritePos);
                         _playbackWritePos += decodedSamples;
                     }
                     else
                     {
-                        // Wrap write
-                        audioSource.clip.SetData(_floatOut, _playbackWritePos);
+                        // Wrap write - split into two parts
+                        // Part 1: Write from current position to end of clip
+                        float[] firstPart = new float[samplesLeft];
+                        Array.Copy(_floatOut, 0, firstPart, 0, samplesLeft);
+                        audioSource.clip.SetData(firstPart, _playbackWritePos);
 
+                        // Part 2: Write remaining samples at beginning of clip
                         int remaining = decodedSamples - samplesLeft;
-                        audioSource.clip.SetData(_floatOut, 0);
+                        float[] secondPart = new float[remaining];
+                        Array.Copy(_floatOut, samplesLeft, secondPart, 0, remaining);
+                        audioSource.clip.SetData(secondPart, 0);
 
                         _playbackWritePos = remaining;
                     }

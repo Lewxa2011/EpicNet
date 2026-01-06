@@ -29,6 +29,11 @@ namespace EpicNet
         private static int _actorCounter = 1;
         private static int GenerateActorNumber() => _actorCounter++;
 
+        /// <summary>
+        /// Reset the actor counter (call when leaving a room or logging out)
+        /// </summary>
+        internal static void ResetActorCounter() => _actorCounter = 1;
+
         public void SetCustomProperties(Dictionary<string, object> properties)
         {
             foreach (var kvp in properties)

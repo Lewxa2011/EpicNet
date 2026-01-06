@@ -71,48 +71,60 @@ namespace EpicNet
 
                 if (syncPosition)
                 {
-                    _startPosition = transform.position;
-                    _previousNetworkPosition = _networkPosition;
-                    _networkPosition = (Vector3)stream.ReceiveNext();
-
-                    // Calculate velocity for extrapolation
-                    if (_initialized && deltaTime > 0.001f)
+                    var posData = stream.ReceiveNext();
+                    if (posData is Vector3 pos)
                     {
-                        _velocity = (_networkPosition - _previousNetworkPosition) / deltaTime;
+                        _startPosition = transform.position;
+                        _previousNetworkPosition = _networkPosition;
+                        _networkPosition = pos;
+
+                        // Calculate velocity for extrapolation
+                        if (_initialized && deltaTime > 0.001f)
+                        {
+                            _velocity = (_networkPosition - _previousNetworkPosition) / deltaTime;
+                        }
                     }
                 }
 
                 if (syncRotation)
                 {
-                    _startRotation = transform.rotation;
-                    _previousNetworkRotation = _networkRotation;
-                    _networkRotation = (Quaternion)stream.ReceiveNext();
-
-                    // HARD GUARD — never allow invalid quaternions
-                    if (!IsValidQuaternion(_networkRotation))
+                    var rotData = stream.ReceiveNext();
+                    if (rotData is Quaternion rot)
                     {
-                        _networkRotation = transform.rotation;
-                    }
+                        _startRotation = transform.rotation;
+                        _previousNetworkRotation = _networkRotation;
+                        _networkRotation = rot;
 
-                    // Calculate angular velocity for extrapolation
-                    if (_initialized && deltaTime > 0.001f && IsValidQuaternion(_previousNetworkRotation))
-                    {
-                        Vector3 deltaEuler = _networkRotation.eulerAngles - _previousNetworkRotation.eulerAngles;
-                        // Handle wrap-around
-                        if (deltaEuler.x > 180) deltaEuler.x -= 360;
-                        if (deltaEuler.y > 180) deltaEuler.y -= 360;
-                        if (deltaEuler.z > 180) deltaEuler.z -= 360;
-                        if (deltaEuler.x < -180) deltaEuler.x += 360;
-                        if (deltaEuler.y < -180) deltaEuler.y += 360;
-                        if (deltaEuler.z < -180) deltaEuler.z += 360;
-                        _angularVelocity = deltaEuler / deltaTime;
+                        // HARD GUARD — never allow invalid quaternions
+                        if (!IsValidQuaternion(_networkRotation))
+                        {
+                            _networkRotation = transform.rotation;
+                        }
+
+                        // Calculate angular velocity for extrapolation
+                        if (_initialized && deltaTime > 0.001f && IsValidQuaternion(_previousNetworkRotation))
+                        {
+                            Vector3 deltaEuler = _networkRotation.eulerAngles - _previousNetworkRotation.eulerAngles;
+                            // Handle wrap-around
+                            if (deltaEuler.x > 180) deltaEuler.x -= 360;
+                            if (deltaEuler.y > 180) deltaEuler.y -= 360;
+                            if (deltaEuler.z > 180) deltaEuler.z -= 360;
+                            if (deltaEuler.x < -180) deltaEuler.x += 360;
+                            if (deltaEuler.y < -180) deltaEuler.y += 360;
+                            if (deltaEuler.z < -180) deltaEuler.z += 360;
+                            _angularVelocity = deltaEuler / deltaTime;
+                        }
                     }
                 }
 
                 if (syncScale)
                 {
-                    _startScale = transform.localScale;
-                    _networkScale = (Vector3)stream.ReceiveNext();
+                    var scaleData = stream.ReceiveNext();
+                    if (scaleData is Vector3 scale)
+                    {
+                        _startScale = transform.localScale;
+                        _networkScale = scale;
+                    }
                 }
 
                 _lastReceiveTime = Time.time;
