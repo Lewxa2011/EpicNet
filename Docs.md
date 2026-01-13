@@ -68,4 +68,4 @@ Contributions are welcome! If you would like to contribute to **EpicNet**, pleas
 - Test any feature or bug fix thoroughly before submitting a request.
 
 ## License
-This project is licensed under the Unlicense License. See the [LICENSE](LICENSE) file for more details.
+This project is licensed under The Unlicense License. See the [LICENSE](LICENSE) file for more details.
