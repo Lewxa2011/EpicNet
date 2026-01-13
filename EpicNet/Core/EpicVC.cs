@@ -209,7 +209,7 @@ namespace EpicNet
             else
             {
                 object data = stream.ReceiveNext();
-                if (data is byte[] opusData)
+                if (data is byte[] opusData && _decoder != null)
                 {
                     int decodedSamples = _decoder.Decode(
                         opusData.AsSpan(),
@@ -225,7 +225,20 @@ namespace EpicNet
                     for (int i = 0; i < decodedSamples; i++)
                         _floatOut[i] = _pcmOut[i] / 32768f;
 
+                    // Guard against null or invalid audio clip
+                    if (audioSource == null || audioSource.clip == null)
+                    {
+                        Debug.LogWarning("EpicNet VC: Audio clip not initialized");
+                        return;
+                    }
+
                     int clipSamples = audioSource.clip.samples;
+                    if (clipSamples <= 0)
+                    {
+                        Debug.LogWarning("EpicNet VC: Invalid audio clip size");
+                        return;
+                    }
+
                     int samplesLeft = clipSamples - _playbackWritePos;
 
                     if (decodedSamples <= samplesLeft)

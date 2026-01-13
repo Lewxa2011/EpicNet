@@ -27,12 +27,26 @@ namespace EpicNet
         }
 
         private static int _actorCounter = 1;
-        private static int GenerateActorNumber() => _actorCounter++;
+        private static readonly object _actorCounterLock = new object();
+
+        private static int GenerateActorNumber()
+        {
+            lock (_actorCounterLock)
+            {
+                return _actorCounter++;
+            }
+        }
 
         /// <summary>
         /// Reset the actor counter (call when leaving a room or logging out)
         /// </summary>
-        internal static void ResetActorCounter() => _actorCounter = 1;
+        internal static void ResetActorCounter()
+        {
+            lock (_actorCounterLock)
+            {
+                _actorCounter = 1;
+            }
+        }
 
         public void SetCustomProperties(Dictionary<string, object> properties)
         {

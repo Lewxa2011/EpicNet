@@ -54,21 +54,33 @@ namespace EpicNet
 
             GameObject obj = null;
 
-            if (Enabled && _pools.TryGetValue(prefabName, out Queue<GameObject> pool) && pool.Count > 0)
+            // Try to get from pool with retry limit to prevent stack overflow
+            int maxRetries = 10;
+            while (Enabled && _pools.TryGetValue(prefabName, out Queue<GameObject> pool) && pool.Count > 0 && maxRetries-- > 0)
             {
                 obj = pool.Dequeue();
 
                 // Check if object was destroyed externally
                 if (obj == null)
                 {
-                    return Get(prefabName, position, rotation);
+                    continue; // Try next pooled object instead of recursing
                 }
 
                 obj.transform.position = position;
                 obj.transform.rotation = rotation;
                 obj.SetActive(true);
+
+                // Ensure object is tracked for return to pool
+                if (!_instanceToPrefab.ContainsKey(obj))
+                {
+                    _instanceToPrefab[obj] = prefabName;
+                }
+
+                break; // Got a valid object
             }
-            else
+
+            // If we didn't get an object from pool, instantiate new one
+            if (obj == null)
             {
                 var prefab = GetPrefab(prefabName);
                 if (prefab == null) return null;

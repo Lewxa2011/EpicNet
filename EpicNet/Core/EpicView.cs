@@ -35,6 +35,12 @@ namespace EpicNet
             if (!IsSceneObject) return;
 
             // Assign scene objects to the master client
+            if (EpicNetwork.MasterClient == null)
+            {
+                Debug.LogWarning($"EpicNet: Cannot assign scene object '{gameObject.name}' - no master client yet");
+                return;
+            }
+
             Owner = EpicNetwork.MasterClient;
             ViewID = EpicNetwork.RegisterSceneObject(this);
 
