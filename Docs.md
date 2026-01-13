@@ -12,7 +12,7 @@
 - **Remote Procedure Calls (RPC)**: Supports the invocation of methods across the network, making it easy to implement game logic between players.
 
 ## Installation and Setup
-Check out the [README](README) for info on Setup.
+Check out the [README](README.md) for info on Setup.
 
 ## Basic Usage
 Here is a brief example of how to use some core functionalities of EpicNet:
