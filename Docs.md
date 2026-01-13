@@ -12,10 +12,7 @@
 - **Remote Procedure Calls (RPC)**: Supports the invocation of methods across the network, making it easy to implement game logic between players.
 
 ## Installation and Setup
-To integrate **EpicNet** into your Unity project:
-1. Clone the repository or download the ZIP file.
-2. Place the `EpicNet` folder into your Unity project's `Assets` directory.
-3. Ensure that your project is set up to use the Epic Online Services if required, following the necessary configuration provided by Epic.
+Check out the [README](README) for info on Setup.
 
 ## Basic Usage
 Here is a brief example of how to use some core functionalities of EpicNet:
