@@ -1,6 +1,6 @@
 # EpicNet
 ## Somewhat vibe-coded networking system based off of Pun 2 w/ a EOS backbone for Unity3d.
-### Made with Unity 6.3
+### Tested on Unity 6.3 and 2022.3.62
 
 # Dependencies:
 ## Uses https://github.com/EOS-Contrib/eos_plugin_for_unity for EOS!!
