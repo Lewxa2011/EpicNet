@@ -1,4 +1,4 @@
-﻿using Epic.OnlineServices;
+using Epic.OnlineServices;
 using Epic.OnlineServices.Connect;
 using Epic.OnlineServices.Lobby;
 using Epic.OnlineServices.P2P;
@@ -13,21 +13,66 @@ using Attribute = Epic.OnlineServices.Lobby.Attribute;
 namespace EpicNet
 {
     /// <summary>
-    /// Main network manager with host migration support
+    /// Central networking manager for EpicNet. Handles connections, rooms, players,
+    /// RPCs, object instantiation, and host migration using Epic Online Services.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is a static class - all networking operations go through static methods.
+    /// Call <see cref="Update"/> every frame from a MonoBehaviour to process network messages.
+    /// </para>
+    /// <para>
+    /// Typical usage flow:
+    /// 1. <see cref="LoginWithDeviceId"/> - Authenticate with EOS
+    /// 2. <see cref="ConnectUsingSettings"/> - Connect to networking services
+    /// 3. <see cref="CreateRoom"/> or <see cref="JoinRoom"/> - Enter a room
+    /// 4. <see cref="Instantiate"/> - Spawn networked objects
+    /// 5. Use <see cref="RPC"/> for remote procedure calls
+    /// </para>
+    /// </remarks>
     public static class EpicNetwork
     {
+        #region Public Properties
+
+        /// <summary>True when connected to EOS networking services.</summary>
         public static bool IsConnected => _isConnected;
+
+        /// <summary>True when logged in with an EOS user ID.</summary>
         public static bool IsLoggedIn => _localUserId != null;
+
+        /// <summary>True when currently in a room/lobby.</summary>
         public static bool InRoom => CurrentRoom != null;
+
+        /// <summary>True if this client is the master client (room host).</summary>
         public static bool IsMasterClient => _isMasterClient;
+
+        /// <summary>The local player instance.</summary>
         public static EpicPlayer LocalPlayer => _localPlayer;
+
+        /// <summary>The current master client. May change during host migration.</summary>
         public static EpicPlayer MasterClient => _masterClient;
+
+        /// <summary>The current room, or null if not in a room.</summary>
         public static EpicRoom CurrentRoom => _currentRoom;
+
+        /// <summary>
+        /// List of all players in the current room.
+        /// Note: For thread-safe access, use GetPlayerListSnapshot().
+        /// </summary>
         public static List<EpicPlayer> PlayerList => _playerList;
+
+        /// <summary>Display name for the local player.</summary>
         public static string NickName { get; set; }
-        public static float SendRate { get; set; } = 20f; // Hz
+
+        /// <summary>How many times per second to send observable data. Default: 20Hz.</summary>
+        public static float SendRate { get; set; } = 20f;
+
+        /// <summary>Current round-trip ping time in milliseconds.</summary>
         public static int Ping { get; private set; }
+
+        #endregion
+
+        #region Private Fields - State
 
         private static bool _isConnected;
         private static bool _isMasterClient;
@@ -36,72 +81,174 @@ namespace EpicNet
         private static EpicRoom _currentRoom;
         private static List<EpicPlayer> _playerList = new List<EpicPlayer>();
 
+        #endregion
+
+        #region Private Fields - Thread Safety
+
+        private static readonly object _playerListLock = new object();
+        private static readonly object _networkObjectsLock = new object();
+        private static readonly object _bufferedRPCsLock = new object();
+        private static readonly object _delayedActionsLock = new object();
+
+        #endregion
+
+        #region Private Fields - EOS Interfaces
+
         private static LobbyInterface _lobbyInterface;
         private static P2PInterface _p2pInterface;
         private static ConnectInterface _connectInterface;
         private static ProductUserId _localUserId;
         private static string _currentLobbyId;
 
+        #endregion
+
+        #region Private Fields - Network Objects
+
         private static readonly System.Random _rng = new System.Random();
-        private static Dictionary<int, EpicView> _networkObjects = new Dictionary<int, EpicView>();
+        private static readonly Dictionary<int, EpicView> _networkObjects = new Dictionary<int, EpicView>();
         private static int _viewIdCounter = 1000;
-        private static Dictionary<int, Action<bool>> _ownershipRequestCallbacks = new Dictionary<int, Action<bool>>();
+        private static readonly Dictionary<int, Action<bool>> _ownershipRequestCallbacks = new Dictionary<int, Action<bool>>();
         private static int _ownershipRequestIdCounter = 0;
 
-        // RPC System
-        private static List<BufferedRPC> _bufferedRPCs = new List<BufferedRPC>();
+        #endregion
+
+        #region Private Fields - RPC System
+
+        private static readonly List<BufferedRPC> _bufferedRPCs = new List<BufferedRPC>();
         private static int _rpcIdCounter = 0;
+        private static readonly Dictionary<string, MethodInfo> _rpcMethodCache = new Dictionary<string, MethodInfo>();
 
-        // Observable sync
+        #endregion
+
+        #region Private Fields - Synchronization
+
         private static float _lastSyncTime;
-        private static float _syncInterval => SendRate > 0 ? 1f / SendRate : 0.05f; // Default to 20Hz if SendRate is 0
+        private static float _syncInterval => SendRate > 0 ? 1f / SendRate : 0.05f;
 
-        // P2P Connection management
+        #endregion
+
+        #region Private Fields - P2P & Connection
+
         private static ulong _p2pNotificationId;
-        private static Dictionary<ProductUserId, float> _playerPingTimes = new Dictionary<ProductUserId, float>();
+        private static readonly Dictionary<ProductUserId, float> _playerPingTimes = new Dictionary<ProductUserId, float>();
+        private static readonly List<EpicRoomInfo> _cachedRoomList = new List<EpicRoomInfo>();
 
-        // Room listing
-        private static List<EpicRoomInfo> _cachedRoomList = new List<EpicRoomInfo>();
+        #endregion
 
-        // Late joiner management
-        private static Dictionary<ProductUserId, bool> _pendingInitialState = new Dictionary<ProductUserId, bool>();
+        #region Private Fields - Late Joiner & Reconnection
+
+        private static readonly Dictionary<ProductUserId, bool> _pendingInitialState = new Dictionary<ProductUserId, bool>();
         private static float _lastInitialStateSendTime = 0f;
-
-        // Reconnection handling
         private static string _lastRoomName;
         private static bool _wasInRoom;
         private static bool _isReconnecting;
         private static float _reconnectAttemptTime;
         private static int _reconnectAttempts;
-        public static bool AutoReconnect { get; set; } = true;
-        public static float ReconnectDelay { get; set; } = 2f;
-        public static int MaxReconnectAttempts { get; set; } = 5;
-        public static bool IsReconnecting => _isReconnecting;
 
-        // Kick/Ban system
-        private static HashSet<string> _bannedPlayerIds = new HashSet<string>();
+        #endregion
 
-        // Delayed callbacks (replaces GameObject-based approach)
-        private static List<DelayedAction> _delayedActions = new List<DelayedAction>();
+        #region Private Fields - Kick/Ban & Security
+
+        private static readonly HashSet<string> _bannedPlayerIds = new HashSet<string>();
+        private static string _currentRoomPassword;
+        private static string _pendingJoinPassword;
+
+        #endregion
+
+        #region Private Fields - Delayed Actions
+
+        private static readonly List<DelayedAction> _delayedActions = new List<DelayedAction>();
+
         private struct DelayedAction
         {
             public float TriggerTime;
             public Action Callback;
         }
 
-        // Room password
-        private static string _currentRoomPassword;
-        private static string _pendingJoinPassword;
+        #endregion
 
-        // Network stats
+        #region Private Fields - Network Statistics
+
         private static long _bytesSent;
         private static long _bytesReceived;
         private static int _packetsSent;
         private static int _packetsReceived;
         private static float _statsResetTime;
-        private static Queue<float> _recentPings = new Queue<float>();
+        private static readonly Queue<float> _recentPings = new Queue<float>();
         private static int _packetsLost;
         private static int _expectedPackets;
+
+        #endregion
+
+        #region Public Properties - Reconnection
+
+        /// <summary>Whether to automatically attempt reconnection if disconnected from a room.</summary>
+        public static bool AutoReconnect { get; set; } = true;
+
+        /// <summary>Delay between reconnection attempts in seconds.</summary>
+        public static float ReconnectDelay { get; set; } = 2f;
+
+        /// <summary>Maximum number of reconnection attempts before giving up.</summary>
+        public static int MaxReconnectAttempts { get; set; } = 5;
+
+        /// <summary>True if currently attempting to reconnect.</summary>
+        public static bool IsReconnecting => _isReconnecting;
+
+        #endregion
+
+        #region Constants
+
+        private const double BufferedRpcLifetime = 300.0; // 5 minutes
+        private const int MaxPingHistory = 20;
+        private const float InitialStateSendDelay = 0.5f;
+        private const float BufferedRpcCleanupInterval = 1f;
+        private const float OwnershipRequestTimeout = 5f;
+
+        #endregion
+
+        #region Public Static Methods - Thread-Safe Access
+
+        /// <summary>
+        /// Gets a thread-safe copy of the player list.
+        /// Use this when iterating over players from callbacks or other threads.
+        /// </summary>
+        public static List<EpicPlayer> GetPlayerListSnapshot()
+        {
+            lock (_playerListLock)
+            {
+                return new List<EpicPlayer>(_playerList);
+            }
+        }
+
+        /// <summary>
+        /// Gets a network object by its ViewID.
+        /// </summary>
+        /// <param name="viewId">The ViewID to look up.</param>
+        /// <returns>The EpicView if found, null otherwise.</returns>
+        public static EpicView GetNetworkObject(int viewId)
+        {
+            lock (_networkObjectsLock)
+            {
+                _networkObjects.TryGetValue(viewId, out EpicView view);
+                return view;
+            }
+        }
+
+        /// <summary>
+        /// Gets the count of active network objects.
+        /// </summary>
+        public static int NetworkObjectCount
+        {
+            get
+            {
+                lock (_networkObjectsLock)
+                {
+                    return _networkObjects.Count;
+                }
+            }
+        }
+
+        #endregion
 
         // Events
         public static event Action OnConnectedToMaster;
@@ -358,8 +505,14 @@ namespace EpicNet
             _masterClient = null;
             _currentRoom = null;
             _currentLobbyId = null;
-            _playerList.Clear();
-            _networkObjects.Clear();
+            lock (_playerListLock)
+            {
+                _playerList.Clear();
+            }
+            lock (_networkObjectsLock)
+            {
+                _networkObjects.Clear();
+            }
             _bufferedRPCs.Clear();
             _ownershipRequestCallbacks.Clear();
             _pendingInitialState.Clear();
@@ -438,6 +591,23 @@ namespace EpicNet
         {
             Debug.Log($"EpicNet: P2P connection request from {data.RemoteUserId}");
 
+            // Only accept connections from players in our lobby or if we're not in a room yet
+            bool isKnownPlayer;
+            ProductUserId remoteUserId = data.RemoteUserId;
+            lock (_playerListLock)
+            {
+                isKnownPlayer =
+                    _playerList.Any(p => ProductUserId.Equals(p.UserId, remoteUserId)) ||
+                    ProductUserId.Equals(_localUserId, remoteUserId) ||
+                    !InRoom;
+            }
+
+            if (!isKnownPlayer)
+            {
+                Debug.LogWarning($"EpicNet: Rejecting P2P connection from unknown user {data.RemoteUserId}");
+                return;
+            }
+
             var acceptOptions = new AcceptConnectionOptions
             {
                 LocalUserId = _localUserId,
@@ -490,7 +660,11 @@ namespace EpicNet
             foreach (var kvp in _pendingInitialState)
             {
                 var userId = kvp.Key;
-                var player = _playerList.Find(p => p.UserId == userId);
+                EpicPlayer player;
+                lock (_playerListLock)
+                {
+                    player = _playerList.Find(p => p.UserId == userId);
+                }
 
                 if (player != null)
                 {
@@ -511,50 +685,71 @@ namespace EpicNet
         {
             if (userId == _localUserId) return;
 
-            // Check if player already exists in list
-            if (_playerList.Any(p => p.UserId == userId)) return;
-
-            var player = new EpicPlayer(userId, $"Player_{userId}");
-
-            // Check if player is banned (master client only)
-            if (IsMasterClient && IsPlayerBanned(userId.ToString()))
+            lock (_playerListLock)
             {
-                Debug.Log($"EpicNet: Banned player tried to join, kicking: {userId}");
-                // Need to add them temporarily to kick them
+                // Check if player already exists in list
+                if (_playerList.Any(p => p.UserId == userId)) return;
+
+                var player = new EpicPlayer(userId, $"Player_{userId}");
+
+                // Check if player is banned (master client only)
+                if (IsMasterClient && IsPlayerBanned(userId.ToString()))
+                {
+                    Debug.Log($"EpicNet: Banned player tried to join, kicking: {userId}");
+                    // Need to add them temporarily to kick them
+                    _playerList.Add(player);
+                    _currentRoom.Players.Add(player);
+                    KickPlayer(player, "You are banned from this room");
+                    return;
+                }
+
                 _playerList.Add(player);
                 _currentRoom.Players.Add(player);
-                KickPlayer(player, "You are banned from this room");
-                return;
+
+                Debug.Log($"EpicNet: Player joined: {player.NickName}");
+
+                if (IsMasterClient)
+                {
+                    _pendingInitialState[userId] = true;
+                }
             }
 
-            _playerList.Add(player);
-            _currentRoom.Players.Add(player);
-
-            Debug.Log($"EpicNet: Player joined: {player.NickName}");
-            OnPlayerEnteredRoom?.Invoke(player);
-
-            if (IsMasterClient)
+            // Fire event outside lock to prevent deadlocks
+            var joinedPlayer = _playerList.FirstOrDefault(p => p.UserId == userId);
+            if (joinedPlayer != null)
             {
-                _pendingInitialState[userId] = true;
-                // Immediately try to send (or add a small delay)
-                SendInitialStateToPlayer(player);
+                OnPlayerEnteredRoom?.Invoke(joinedPlayer);
+
+                if (IsMasterClient)
+                {
+                    // Immediately try to send (or add a small delay)
+                    SendInitialStateToPlayer(joinedPlayer);
+                }
             }
         }
 
         private static void HandlePlayerLeft(ProductUserId userId)
         {
-            var player = _playerList.FirstOrDefault(p => p.UserId == userId);
-            if (player == null) return;
+            EpicPlayer player = null;
+            bool wasMasterClient = false;
 
-            _playerList.Remove(player);
-            _currentRoom.Players.Remove(player);
+            lock (_playerListLock)
+            {
+                player = _playerList.FirstOrDefault(p => p.UserId == userId);
+                if (player == null) return;
+
+                wasMasterClient = player.IsMasterClient;
+                _playerList.Remove(player);
+                _currentRoom?.Players.Remove(player);
+            }
+
             Debug.Log($"EpicNet: Player left: {player.NickName}");
 
             // Clean up network objects owned by this player
             CleanupPlayerObjects(player);
 
             // Check if the master client left
-            if (player.IsMasterClient)
+            if (wasMasterClient)
             {
                 PerformHostMigration();
             }
@@ -587,42 +782,63 @@ namespace EpicNet
         {
             Debug.Log("EpicNet: Performing host migration...");
 
-            // Handle empty player list case - promote local player if available
-            if (_playerList == null || _playerList.Count == 0)
+            EpicPlayer newMaster = null;
+
+            lock (_playerListLock)
             {
-                if (_localPlayer != null)
+                // Handle empty player list case - promote local player if available
+                if (_playerList == null || _playerList.Count == 0)
                 {
-                    Debug.Log("EpicNet: No other players remaining, promoting local player to master");
-                    _localPlayer.IsMasterClient = true;
-                    _masterClient = _localPlayer;
-                    _isMasterClient = true;
-                    OnMasterClientSwitched?.Invoke(_masterClient);
+                    if (_localPlayer != null)
+                    {
+                        Debug.Log("EpicNet: No other players remaining, promoting local player to master");
+                        _localPlayer.IsMasterClient = true;
+                        _masterClient = _localPlayer;
+                        _isMasterClient = true;
+                        // Fire event outside lock
+                        newMaster = _masterClient;
+                    }
+                    else
+                    {
+                        Debug.LogWarning("EpicNet: No players remaining for host migration");
+                        _masterClient = null;
+                        _isMasterClient = false;
+                    }
                 }
                 else
                 {
-                    Debug.LogWarning("EpicNet: No players remaining for host migration");
-                    _masterClient = null;
-                    _isMasterClient = false;
+                    // Find new master client (player with lowest actor number)
+                    newMaster = _playerList.OrderBy(p => p.ActorNumber).FirstOrDefault();
+
+                    if (newMaster != null)
+                    {
+                        // Clear old master status
+                        foreach (var player in _playerList)
+                        {
+                            player.IsMasterClient = false;
+                        }
+
+                        // Assign new master
+                        newMaster.IsMasterClient = true;
+                        _masterClient = newMaster;
+                        _isMasterClient = (newMaster.UserId == _localUserId);
+                    }
+                    else
+                    {
+                        Debug.LogWarning("EpicNet: Could not determine new master client");
+                        _masterClient = null;
+                        _isMasterClient = false;
+                        if (_localPlayer != null)
+                        {
+                            _localPlayer.IsMasterClient = false;
+                        }
+                    }
                 }
-                return;
             }
 
-            // Find new master client (player with lowest actor number)
-            var newMaster = _playerList.OrderBy(p => p.ActorNumber).FirstOrDefault();
-
+            // Perform actions outside lock
             if (newMaster != null)
             {
-                // Clear old master status
-                foreach (var player in _playerList)
-                {
-                    player.IsMasterClient = false;
-                }
-
-                // Assign new master
-                newMaster.IsMasterClient = true;
-                _masterClient = newMaster;
-                _isMasterClient = (newMaster.UserId == _localUserId);
-
                 if (_isMasterClient)
                 {
                     Debug.Log("EpicNet: This client is now the master!");
@@ -638,31 +854,41 @@ namespace EpicNet
 
                 OnMasterClientSwitched?.Invoke(_masterClient);
             }
-            else
+            else if (_localPlayer != null && _masterClient == _localPlayer)
             {
-                Debug.LogWarning("EpicNet: Could not determine new master client");
-                _masterClient = null;
-                _isMasterClient = false;
-                if (_localPlayer != null)
-                {
-                    _localPlayer.IsMasterClient = false;
-                }
+                // Empty room case - still fire the event
+                OnMasterClientSwitched?.Invoke(_masterClient);
             }
         }
 
         private static void TakeOwnershipOfOrphanedObjects()
         {
             // Use ToList() to avoid modification during iteration
-            var views = _networkObjects.Values.ToList();
+            List<EpicView> views;
+            lock (_networkObjectsLock)
+            {
+                views = _networkObjects.Values.ToList();
+            }
+
+            List<ProductUserId> activeUserIds;
+            lock (_playerListLock)
+            {
+                activeUserIds = _playerList.Select(p => p.UserId).ToList();
+            }
 
             foreach (var view in views)
             {
                 if (view == null || view.gameObject == null) continue;
 
-                if (view.Owner == null || !_playerList.Any(p => p.UserId == view.Owner.UserId))
+                // Scene objects should always belong to master client
+                bool isOrphaned = view.Owner == null ||
+                                  !activeUserIds.Any(uid => uid == view.Owner.UserId);
+                bool isSceneObjectNeedingReassignment = view.IsSceneObject && view.Owner != _localPlayer;
+
+                if (isOrphaned || isSceneObjectNeedingReassignment)
                 {
                     view.Owner = _localPlayer;
-                    Debug.Log($"EpicNet: Took ownership of orphaned object {view.ViewID}");
+                    Debug.Log($"EpicNet: Took ownership of {(view.IsSceneObject ? "scene" : "orphaned")} object {view.ViewID}");
 
                     // Notify other players about the ownership transfer
                     SendOwnershipTransfer(view.ViewID, _localPlayer);
@@ -980,11 +1206,16 @@ namespace EpicNet
                 IsOpen = true
             };
 
-            // Retrieve custom RoomName attribute
-            var attributeOptions = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = "RoomName" };
-            if (lobbyDetails.CopyAttributeByKey(ref attributeOptions, out Attribute? attr) == Result.Success && attr.HasValue)
+            var opts = new LobbyDetailsCopyAttributeByKeyOptions
             {
-                roomInfo.Name = attr.Value.Data.Value.Value.ToString();
+                AttrKey = "RoomName"
+            };
+
+            if (lobbyDetails.CopyAttributeByKey(ref opts, out Attribute? attr) == Result.Success &&
+                attr.HasValue &&
+                attr.Value.Data.Value.Value.ValueType == AttributeType.String)
+            {
+                roomInfo.Name = attr.Value.Data.Value.Value.AsUtf8;
             }
 
             return roomInfo;
@@ -1279,7 +1510,13 @@ namespace EpicNet
         {
             var data = SerializeInstantiateMessage(viewId, prefabName, position, rotation, owner);
 
-            foreach (var player in _playerList)
+            List<EpicPlayer> playerSnapshot;
+            lock (_playerListLock)
+            {
+                playerSnapshot = new List<EpicPlayer>(_playerList);
+            }
+
+            foreach (var player in playerSnapshot)
             {
                 if (player.UserId != _localUserId)
                 {
@@ -1292,7 +1529,13 @@ namespace EpicNet
         {
             var data = SerializeDestroyMessage(viewId);
 
-            foreach (var player in _playerList)
+            List<EpicPlayer> playerSnapshot;
+            lock (_playerListLock)
+            {
+                playerSnapshot = new List<EpicPlayer>(_playerList);
+            }
+
+            foreach (var player in playerSnapshot)
             {
                 if (player.UserId != _localUserId)
                 {
@@ -1320,14 +1563,17 @@ namespace EpicNet
             // Buffer if needed
             if (target == RpcTarget.AllBuffered || target == RpcTarget.OthersBuffered || target == RpcTarget.AllBufferedViaServer)
             {
-                _bufferedRPCs.Add(new BufferedRPC
+                lock (_bufferedRPCsLock)
                 {
-                    ViewID = view.ViewID,
-                    MethodName = methodName,
-                    Parameters = parameters,
-                    Sender = _localPlayer,
-                    Timestamp = Time.timeAsDouble
-                });
+                    _bufferedRPCs.Add(new BufferedRPC
+                    {
+                        ViewID = view.ViewID,
+                        MethodName = methodName,
+                        Parameters = parameters,
+                        Sender = _localPlayer,
+                        Timestamp = Time.timeAsDouble
+                    });
+                }
             }
 
             // Determine if unreliable
@@ -1380,7 +1626,13 @@ namespace EpicNet
 
         private static void SendRPCToOthers(byte[] rpcData, bool reliable = true)
         {
-            foreach (var player in _playerList)
+            List<EpicPlayer> playerSnapshot;
+            lock (_playerListLock)
+            {
+                playerSnapshot = new List<EpicPlayer>(_playerList);
+            }
+
+            foreach (var player in playerSnapshot)
             {
                 if (player.UserId != _localUserId)
                 {
@@ -1428,14 +1680,21 @@ namespace EpicNet
             }
         }
 
-        // RPC method cache for performance - key is "TypeName:MethodName"
-        private static Dictionary<string, MethodInfo> _rpcMethodCache = new Dictionary<string, MethodInfo>();
-
         private static void ExecuteRPC(int viewId, string methodName, object[] parameters, EpicPlayer sender)
         {
-            if (!_networkObjects.TryGetValue(viewId, out EpicView view))
+            EpicView view;
+            lock (_networkObjectsLock)
             {
-                Debug.LogWarning($"EpicNet: Cannot execute RPC - View {viewId} not found");
+                if (!_networkObjects.TryGetValue(viewId, out view))
+                {
+                    Debug.LogWarning($"[EpicNet] Cannot execute RPC '{methodName}' - View {viewId} not found");
+                    return;
+                }
+            }
+
+            if (view == null || view.gameObject == null)
+            {
+                Debug.LogWarning($"[EpicNet] Cannot execute RPC '{methodName}' - View {viewId} was destroyed");
                 return;
             }
 
@@ -1465,6 +1724,14 @@ namespace EpicNet
 
                 if (method != null)
                 {
+                    // Security validation - check if sender is allowed to call this RPC
+                    var rpcAttribute = method.GetCustomAttribute<EpicRPC>();
+                    if (rpcAttribute != null && !ValidateRpcSecurity(rpcAttribute.Security, sender, view))
+                    {
+                        Debug.LogWarning($"[EpicNet] RPC '{methodName}' blocked - sender {sender?.NickName ?? "null"} failed security check");
+                        return;
+                    }
+
                     try
                     {
                         // Add sender info if method expects it
@@ -1489,12 +1756,38 @@ namespace EpicNet
                     }
                     catch (Exception e)
                     {
-                        Debug.LogError($"EpicNet: Error executing RPC {methodName}: {e.Message}");
+                        Debug.LogError($"[EpicNet] Error executing RPC '{methodName}': {e.Message}");
                     }
                 }
             }
 
-            Debug.LogWarning($"EpicNet: RPC method {methodName} not found on view {viewId}");
+            Debug.LogWarning($"[EpicNet] RPC method '{methodName}' not found on view {viewId}");
+        }
+
+        /// <summary>
+        /// Validates if a sender is allowed to call an RPC based on its security level.
+        /// </summary>
+        private static bool ValidateRpcSecurity(RpcSecurityLevel security, EpicPlayer sender, EpicView view)
+        {
+            if (sender == null) return false;
+
+            switch (security)
+            {
+                case RpcSecurityLevel.Anyone:
+                    return true;
+
+                case RpcSecurityLevel.OwnerOnly:
+                    return view.Owner != null && sender == view.Owner;
+
+                case RpcSecurityLevel.MasterClientOnly:
+                    return sender.IsMasterClient;
+
+                case RpcSecurityLevel.OwnerOrMasterClient:
+                    return sender.IsMasterClient || (view.Owner != null && sender == view.Owner);
+
+                default:
+                    return false;
+            }
         }
 
         /// <summary>
@@ -1518,6 +1811,9 @@ namespace EpicNet
             // Try to send pending initial states (for late joiners)
             TrySendPendingInitialStates();
 
+            // Cleanup expired buffered RPCs
+            CleanupExpiredBufferedRPCs();
+
             // Sync observables at the configured rate
             if (Time.time - _lastSyncTime >= _syncInterval)
             {
@@ -1526,22 +1822,60 @@ namespace EpicNet
             }
         }
 
+        private static float _lastBufferedRPCCleanup = 0f;
+
+        private static void CleanupExpiredBufferedRPCs()
+        {
+            // Only cleanup once per second to avoid overhead
+            if (Time.time - _lastBufferedRPCCleanup < BufferedRpcCleanupInterval) return;
+            _lastBufferedRPCCleanup = Time.time;
+
+            double currentTime = Time.timeAsDouble;
+            lock (_bufferedRPCsLock)
+            {
+                _bufferedRPCs.RemoveAll(rpc => currentTime - rpc.Timestamp > BufferedRpcLifetime);
+            }
+        }
+
         private static void ProcessDelayedActions()
         {
-            for (int i = _delayedActions.Count - 1; i >= 0; i--)
+            lock (_delayedActionsLock)
             {
-                if (Time.time >= _delayedActions[i].TriggerTime)
+                for (int i = _delayedActions.Count - 1; i >= 0; i--)
                 {
-                    _delayedActions[i].Callback?.Invoke();
-                    _delayedActions.RemoveAt(i);
+                    if (Time.time >= _delayedActions[i].TriggerTime)
+                    {
+                        var action = _delayedActions[i];
+                        _delayedActions.RemoveAt(i);
+
+                        // Invoke outside the lock to prevent deadlocks
+                        try
+                        {
+                            action.Callback?.Invoke();
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.LogError($"[EpicNet] Error in delayed action: {e.Message}");
+                        }
+                    }
                 }
             }
         }
 
         private static void SyncObservables()
         {
-            // Use ToList() to avoid modification during iteration if objects are destroyed
-            var views = _networkObjects.Values.ToList();
+            // Create thread-safe snapshots
+            List<EpicView> views;
+            lock (_networkObjectsLock)
+            {
+                views = _networkObjects.Values.ToList();
+            }
+
+            List<EpicPlayer> playerSnapshot;
+            lock (_playerListLock)
+            {
+                playerSnapshot = new List<EpicPlayer>(_playerList);
+            }
 
             foreach (var view in views)
             {
@@ -1555,7 +1889,11 @@ namespace EpicNet
                 }
                 catch (MissingReferenceException)
                 {
-                    // Object was destroyed during iteration
+                    // Object was destroyed during iteration - remove from tracking
+                    lock (_networkObjectsLock)
+                    {
+                        _networkObjects.Remove(view.ViewID);
+                    }
                     continue;
                 }
                 catch (NullReferenceException)
@@ -1586,7 +1924,7 @@ namespace EpicNet
                 {
                     byte[] data = SerializeObservableData(view.ViewID, stream);
 
-                    foreach (var player in _playerList)
+                    foreach (var player in playerSnapshot)
                     {
                         if (player.UserId != _localUserId)
                         {
@@ -1692,16 +2030,60 @@ namespace EpicNet
 
             int viewId = BitConverter.ToInt32(data, 1);
             int ownerIdLength = BitConverter.ToInt32(data, 5);
+
+            // Validate length before reading string
+            if (data.Length < 9 + ownerIdLength)
+            {
+                Debug.LogWarning("[EpicNet] Malformed ownership transfer packet - ignoring");
+                return;
+            }
+
             string ownerIdString = System.Text.Encoding.UTF8.GetString(data, 9, ownerIdLength);
 
-            if (_networkObjects.TryGetValue(viewId, out EpicView view))
+            EpicView view;
+            lock (_networkObjectsLock)
             {
-                var newOwner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
-                if (newOwner != null)
-                {
-                    view.Owner = newOwner;
-                    Debug.Log($"EpicNet: View {viewId} ownership transferred to {newOwner.NickName}");
-                }
+                _networkObjects.TryGetValue(viewId, out view);
+            }
+
+            if (view == null) return;
+
+            // Security validation - only the current owner or master client can transfer ownership
+            EpicPlayer sender;
+            lock (_playerListLock)
+            {
+                sender = _playerList.Find(p => p.UserId != null && p.UserId.Equals(senderId));
+            }
+
+            bool isCurrentOwner = view.Owner != null && view.Owner.UserId != null && view.Owner.UserId.Equals(senderId);
+            bool isMaster = sender != null && sender.IsMasterClient;
+
+            // For Fixed ownership, only master can force transfer
+            if (view.OwnershipTransfer == OwnershipOption.Fixed && !isMaster)
+            {
+                Debug.LogWarning($"[EpicNet] Ownership transfer rejected for ViewID {viewId} - ownership is Fixed");
+                return;
+            }
+
+            // For Request ownership, only the owner can approve (already validated by the request flow)
+            // For Takeover, anyone can take ownership
+
+            if (!isCurrentOwner && !isMaster && view.OwnershipTransfer != OwnershipOption.Takeover)
+            {
+                Debug.LogWarning($"[EpicNet] Ownership transfer rejected for ViewID {viewId} - sender is not authorized");
+                return;
+            }
+
+            EpicPlayer newOwner;
+            lock (_playerListLock)
+            {
+                newOwner = _playerList.Find(p => p.UserId != null && p.UserId.ToString() == ownerIdString);
+            }
+
+            if (newOwner != null)
+            {
+                view.Owner = newOwner;
+                Debug.Log($"[EpicNet] View {viewId} ownership transferred to {newOwner.NickName}");
             }
         }
 
@@ -1712,9 +2094,20 @@ namespace EpicNet
             int viewId = BitConverter.ToInt32(data, 1);
             int requestId = BitConverter.ToInt32(data, 5);
 
-            if (_networkObjects.TryGetValue(viewId, out EpicView view))
+            EpicView view;
+            lock (_networkObjectsLock)
             {
-                var requester = _playerList.Find(p => p.UserId == senderId);
+                _networkObjects.TryGetValue(viewId, out view);
+            }
+
+            if (view != null)
+            {
+                EpicPlayer requester;
+                lock (_playerListLock)
+                {
+                    requester = _playerList.Find(p => p.UserId == senderId);
+                }
+
                 if (requester != null)
                 {
                     view.HandleOwnershipRequest(requester, (approved) =>
@@ -1764,7 +2157,12 @@ namespace EpicNet
                 parameters[i] = DeserializeParameter(data, ref offset);
             }
 
-            var sender = _playerList.Find(p => p.UserId == senderId);
+            EpicPlayer sender;
+            lock (_playerListLock)
+            {
+                sender = _playerList.Find(p => p.UserId == senderId);
+            }
+
             if (sender != null)
             {
                 ExecuteRPC(viewId, methodName, parameters, sender);
@@ -1778,17 +2176,29 @@ namespace EpicNet
 
             int viewId = BitConverter.ToInt32(data, 1);
 
-            if (_networkObjects.TryGetValue(viewId, out EpicView view))
+            EpicView view;
+            lock (_networkObjectsLock)
+            {
+                _networkObjects.TryGetValue(viewId, out view);
+            }
+
+            if (view != null)
             {
                 // Check for destroyed objects
-                if (view == null || view.gameObject == null) return;
+                if (view.gameObject == null) return;
 
                 var stream = new EpicStream(false);
                 DeserializeObservableStream(data, 5, stream);
 
+                EpicPlayer sender;
+                lock (_playerListLock)
+                {
+                    sender = _playerList.Find(p => p.UserId == senderId);
+                }
+
                 var messageInfo = new EpicMessageInfo
                 {
-                    Sender = _playerList.Find(p => p.UserId == senderId),
+                    Sender = sender,
                     Timestamp = Time.timeAsDouble
                 };
 
@@ -1873,15 +2283,19 @@ namespace EpicNet
                     view.ViewID = viewId;
 
                     // Try to find owner in player list
-                    var owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
-
-                    // Fallback: use sender as owner if owner not found
-                    if (owner == null)
+                    EpicPlayer owner;
+                    lock (_playerListLock)
                     {
-                        owner = _playerList.Find(p => p.UserId == senderId);
+                        owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+
+                        // Fallback: use sender as owner if owner not found
                         if (owner == null)
                         {
-                            Debug.LogWarning($"EpicNet: Owner not found for instantiated object {viewId}, using null owner");
+                            owner = _playerList.Find(p => p.UserId == senderId);
+                            if (owner == null)
+                            {
+                                Debug.LogWarning($"EpicNet: Owner not found for instantiated object {viewId}, using null owner");
+                            }
                         }
                     }
 
@@ -1898,10 +2312,32 @@ namespace EpicNet
 
             int viewId = BitConverter.ToInt32(data, 1);
 
-            if (_networkObjects.TryGetValue(viewId, out EpicView view))
+            EpicView view;
+            lock (_networkObjectsLock)
             {
+                _networkObjects.TryGetValue(viewId, out view);
+            }
+
+            if (view != null)
+            {
+                // Security validation - verify sender owns the object or is master client
+                EpicPlayer sender;
+                lock (_playerListLock)
+                {
+                    sender = _playerList.Find(p => p.UserId != null && p.UserId.Equals(senderId));
+                }
+
+                bool isOwner = view.Owner != null && view.Owner.UserId != null && view.Owner.UserId.Equals(senderId);
+                bool isMaster = sender != null && sender.IsMasterClient;
+
+                if (!isOwner && !isMaster)
+                {
+                    Debug.LogWarning($"[EpicNet] Destroy request for ViewID {viewId} rejected - sender is not owner or master");
+                    return;
+                }
+
                 UnregisterNetworkObject(viewId);
-                if (view != null && view.gameObject != null)
+                if (view.gameObject != null)
                 {
                     // Return to pool if enabled
                     if (EpicPool.Enabled && !string.IsNullOrEmpty(view.PrefabName))
@@ -1943,10 +2379,11 @@ namespace EpicNet
 
         private static void HandleKickReceived(ProductUserId senderId, byte[] data)
         {
-            // Verify kick came from master client
-            if (_masterClient == null || senderId != _masterClient.UserId)
+            // Security validation - verify kick came from master client
+            if (_masterClient == null || _masterClient.UserId == null ||
+                senderId == null || !_masterClient.UserId.Equals(senderId))
             {
-                Debug.LogWarning("EpicNet: Received kick from non-master client, ignoring");
+                Debug.LogWarning("[EpicNet] Received kick from non-master client - ignoring potential attack");
                 return;
             }
 
@@ -2034,10 +2471,14 @@ namespace EpicNet
                         view.ViewID = viewId;
 
                         // Try to find owner in player list, fallback to sender
-                        var owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
-                        if (owner == null)
+                        EpicPlayer owner;
+                        lock (_playerListLock)
                         {
-                            owner = _playerList.Find(p => p.UserId == senderId);
+                            owner = _playerList.Find(p => p.UserId.ToString() == ownerIdString);
+                            if (owner == null)
+                            {
+                                owner = _playerList.Find(p => p.UserId == senderId);
+                            }
                         }
 
                         view.Owner = owner;
@@ -2076,7 +2517,11 @@ namespace EpicNet
                     parameters[j] = DeserializeParameter(data, ref offset);
                 }
 
-                var sender = _playerList.Find(p => p.UserId == senderId);
+                EpicPlayer sender;
+                lock (_playerListLock)
+                {
+                    sender = _playerList.Find(p => p.UserId == senderId);
+                }
                 ExecuteRPC(viewId, methodName, parameters, sender);
             }
 
@@ -2113,7 +2558,13 @@ namespace EpicNet
 
             byte[] data = SerializeOwnershipTransfer(viewId, newOwner);
 
-            foreach (var player in _playerList)
+            List<EpicPlayer> playerSnapshot;
+            lock (_playerListLock)
+            {
+                playerSnapshot = new List<EpicPlayer>(_playerList);
+            }
+
+            foreach (var player in playerSnapshot)
             {
                 if (player.UserId != _localUserId)
                 {
@@ -2479,16 +2930,23 @@ namespace EpicNet
             {
                 writer.Write((byte)PacketType.InitialState);
 
-                // Filter valid network objects first
-                var validObjects = _networkObjects.Values
-                    .Where(v => v != null && v.Owner != null && v.Owner.UserId != null && !string.IsNullOrEmpty(v.PrefabName))
-                    .ToList();
+                // Get thread-safe snapshot of network objects
+                List<EpicView> validObjects;
+                lock (_networkObjectsLock)
+                {
+                    validObjects = _networkObjects.Values
+                        .Where(v => v != null && v.Owner != null && v.Owner.UserId != null && !string.IsNullOrEmpty(v.PrefabName))
+                        .ToList();
+                }
 
                 // Serialize all valid network objects
                 writer.Write(validObjects.Count);
 
                 foreach (var view in validObjects)
                 {
+                    // Skip if the view was destroyed since we took the snapshot
+                    if (view == null || view.gameObject == null) continue;
+
                     writer.Write(view.ViewID);
                     writer.Write(view.PrefabName.Length);
                     writer.Write(System.Text.Encoding.UTF8.GetBytes(view.PrefabName));
@@ -2505,10 +2963,16 @@ namespace EpicNet
                     writer.Write(ownerIdBytes);
                 }
 
-                // Serialize buffered RPCs
-                writer.Write(_bufferedRPCs.Count);
+                // Get thread-safe snapshot of buffered RPCs
+                List<BufferedRPC> bufferedRpcSnapshot;
+                lock (_bufferedRPCsLock)
+                {
+                    bufferedRpcSnapshot = new List<BufferedRPC>(_bufferedRPCs);
+                }
 
-                foreach (var rpc in _bufferedRPCs)
+                writer.Write(bufferedRpcSnapshot.Count);
+
+                foreach (var rpc in bufferedRpcSnapshot)
                 {
                     writer.Write(rpc.ViewID);
                     writer.Write(rpc.MethodName.Length);
@@ -2556,11 +3020,14 @@ namespace EpicNet
 
         private static void DelayedCallback(float delay, Action callback)
         {
-            _delayedActions.Add(new DelayedAction
+            lock (_delayedActionsLock)
             {
-                TriggerTime = Time.time + delay,
-                Callback = callback
-            });
+                _delayedActions.Add(new DelayedAction
+                {
+                    TriggerTime = Time.time + delay,
+                    Callback = callback
+                });
+            }
         }
 
         private static void OnLobbyCreated(ref CreateLobbyCallbackInfo data, string roomName)
@@ -2575,8 +3042,11 @@ namespace EpicNet
 
                 _localPlayer.IsMasterClient = true;
                 _masterClient = _localPlayer;
-                _playerList.Add(_localPlayer);
-                _currentRoom.Players.Add(_localPlayer);
+                lock (_playerListLock)
+                {
+                    _playerList.Add(_localPlayer);
+                    _currentRoom.Players.Add(_localPlayer);
+                }
 
                 // Set room name as attribute
                 SetRoomProperties(new Dictionary<string, object> { { "RoomName", roomName } });
@@ -2657,8 +3127,11 @@ namespace EpicNet
                 _localPlayer.IsMasterClient = false;
                 _masterClient = null;
 
-                _playerList.Add(_localPlayer);
-                _currentRoom.Players.Add(_localPlayer);
+                lock (_playerListLock)
+                {
+                    _playerList.Add(_localPlayer);
+                    _currentRoom.Players.Add(_localPlayer);
+                }
 
                 // Copy lobby details to fetch members using the correct method
                 var copyOptions = new CopyLobbyDetailsHandleOptions
@@ -2727,47 +3200,50 @@ namespace EpicNet
             var countOptions = new LobbyDetailsGetMemberCountOptions();
             uint memberCount = lobbyDetails.GetMemberCount(ref countOptions);
 
-            for (uint i = 0; i < memberCount; i++)
+            lock (_playerListLock)
             {
-                var memberOptions = new LobbyDetailsGetMemberByIndexOptions
+                for (uint i = 0; i < memberCount; i++)
                 {
-                    MemberIndex = i
-                };
+                    var memberOptions = new LobbyDetailsGetMemberByIndexOptions
+                    {
+                        MemberIndex = i
+                    };
 
-                ProductUserId memberId = lobbyDetails.GetMemberByIndex(ref memberOptions);
+                    ProductUserId memberId = lobbyDetails.GetMemberByIndex(ref memberOptions);
 
-                // Skip ourselves (already added)
-                if (memberId == _localUserId) continue;
+                    // Skip ourselves (already added)
+                    if (memberId == _localUserId) continue;
 
-                // Add other players
-                var player = new EpicPlayer(memberId, $"Player_{memberId}");
+                    // Add other players
+                    var player = new EpicPlayer(memberId, $"Player_{memberId}");
 
-                // Check if this member is the lobby owner
-                if (ownerId != null && memberId == ownerId)
-                {
-                    player.IsMasterClient = true;
-                    _masterClient = player;
-                    Debug.Log($"EpicNet: Found master client: {player.NickName}");
+                    // Check if this member is the lobby owner
+                    if (ownerId != null && memberId == ownerId)
+                    {
+                        player.IsMasterClient = true;
+                        _masterClient = player;
+                        Debug.Log($"EpicNet: Found master client: {player.NickName}");
+                    }
+
+                    _playerList.Add(player);
+                    _currentRoom.Players.Add(player);
                 }
 
-                _playerList.Add(player);
-                _currentRoom.Players.Add(player);
-            }
-
-            // If we didn't find a master, set the first player as master
-            if (_masterClient == null && _playerList.Count > 0)
-            {
-                var firstPlayer = _playerList[0];
-                firstPlayer.IsMasterClient = true;
-                _masterClient = firstPlayer;
-
-                // Update _isMasterClient if the first player is us
-                if (firstPlayer.UserId == _localUserId)
+                // If we didn't find a master, set the first player as master
+                if (_masterClient == null && _playerList.Count > 0)
                 {
-                    _isMasterClient = true;
-                }
+                    var firstPlayer = _playerList[0];
+                    firstPlayer.IsMasterClient = true;
+                    _masterClient = firstPlayer;
 
-                Debug.Log($"EpicNet: No owner found, using first player as master: {firstPlayer.NickName}");
+                    // Update _isMasterClient if the first player is us
+                    if (firstPlayer.UserId == _localUserId)
+                    {
+                        _isMasterClient = true;
+                    }
+
+                    Debug.Log($"EpicNet: No owner found, using first player as master: {firstPlayer.NickName}");
+                }
             }
         }
 
@@ -2776,9 +3252,13 @@ namespace EpicNet
             if (data.ResultCode == Result.Success)
             {
                 // Clear room players before nulling the room
-                if (_currentRoom != null)
+                lock (_playerListLock)
                 {
-                    _currentRoom.Players.Clear();
+                    if (_currentRoom != null)
+                    {
+                        _currentRoom.Players.Clear();
+                    }
+                    _playerList.Clear();
                 }
 
                 _currentRoom = null;
@@ -2792,8 +3272,10 @@ namespace EpicNet
                     _localPlayer.IsMasterClient = false;
                 }
 
-                _playerList.Clear();
-                _networkObjects.Clear();
+                lock (_networkObjectsLock)
+                {
+                    _networkObjects.Clear();
+                }
                 _bufferedRPCs.Clear();
                 _pendingInitialState.Clear();
 
@@ -2805,11 +3287,21 @@ namespace EpicNet
             }
         }
 
-        private static int GenerateViewID() => _viewIdCounter++;
+        private static int GenerateViewID()
+        {
+            // Use high bits for player actor number, low bits for counter
+            // This ensures different players never generate the same ViewID
+            int actorPart = (_localPlayer?.ActorNumber ?? 1) << 20; // Supports up to 4095 actors
+            int counterPart = (_viewIdCounter++) & 0xFFFFF; // Supports ~1M objects per player
+            return actorPart | counterPart;
+        }
 
         private static void RegisterNetworkObject(EpicView view)
         {
-            _networkObjects[view.ViewID] = view;
+            lock (_networkObjectsLock)
+            {
+                _networkObjects[view.ViewID] = view;
+            }
         }
 
         /// <summary>
@@ -2820,13 +3312,19 @@ namespace EpicNet
         {
             int viewId = GenerateViewID();
             view.ViewID = viewId;
-            _networkObjects[viewId] = view;
+            lock (_networkObjectsLock)
+            {
+                _networkObjects[viewId] = view;
+            }
             return viewId;
         }
 
         public static void UnregisterNetworkObject(int viewId)
         {
-            _networkObjects.Remove(viewId);
+            lock (_networkObjectsLock)
+            {
+                _networkObjects.Remove(viewId);
+            }
         }
 
         /// <summary>

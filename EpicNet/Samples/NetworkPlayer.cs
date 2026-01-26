@@ -16,7 +16,8 @@ public class NetworkPlayer : MonoBehaviour
 
     void Update()
     {
-        if (!view.IsMine) return;
+        if (view == null || !view.IsMine) return;
+        if (NetworkManager.Instance == null) return;
 
         SyncTransform(NetworkManager.Instance.localHead, head);
         SyncTransform(NetworkManager.Instance.localLeftHand, leftHand);
@@ -25,6 +26,7 @@ public class NetworkPlayer : MonoBehaviour
 
     void SyncTransform(Transform from, Transform to)
     {
+        if (from == null || to == null) return;
         to.position = from.position;
         to.rotation = from.rotation;
     }

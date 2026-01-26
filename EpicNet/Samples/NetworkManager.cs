@@ -53,13 +53,13 @@ public class NetworkManager : EpicMonoBehaviourCallbacks
     {
         EpicNetwork.NickName = cachedName;
         EpicNetwork.ConnectUsingSettings();
-        EpicNetwork.JoinRoom("Diddy");
     }
 
     public override void OnConnectedToMaster()
     {
         base.OnConnectedToMaster();
         Debug.Log("Connected to EOS Master");
+        EpicNetwork.JoinRoom("Diddy");
     }
 
     public override void OnJoinedRoom()
