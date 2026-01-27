@@ -96,16 +96,17 @@ public class GameManager : EpicMonoBehaviourCallbacks
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     Your Game Code                       │
+│                     Your Game Code                      │
 ├─────────────────────────────────────────────────────────┤
-│  EpicNetwork  │  EpicView  │  EpicVC  │  EpicPool      │
+│  EpicNetwork  │  EpicView  │  EpicVC  │  EpicPool       │
 ├─────────────────────────────────────────────────────────┤
-│  EpicStats │ EpicLeaderboards │ EpicPlayerData │ ...   │
+│  EpicStats │ EpicLeaderboards │ EpicPlayerData │ ...    │
 ├─────────────────────────────────────────────────────────┤
-│              Epic Online Services (EOS)                  │
+│              Epic Online Services (EOS)                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ## License
 
 EpicNet is provided as-is for use in your Unity projects.
+
